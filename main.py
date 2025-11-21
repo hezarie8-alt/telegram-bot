@@ -11,7 +11,6 @@ from psycopg2 import pool
 
 TELEGRAM_TOKEN = '7690534947:AAFf2YpBstmMoRkvlxKiSygKKssVBGwnEYo'
 OPENROUTER_API_KEY = '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'
-# USERS_FILE و LOCK_FILE دیگر مورد نیاز نیستند
 ADMIN_ID = 5403642668  # شناسه تلگرام ادمین (این را با شناسه خودتان جایگزین کنید)
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
@@ -51,43 +50,50 @@ def release_db_connection(conn):
         db_pool.putconn(conn)
 
 def init_db():
-    """ایجاد جدول کاربران در دیتابیس در صورت عدم وجود"""
+    """
+    ایجاد جدول کاربران در دیتابیس در صورت عدم وجود
+    و اضافه کردن ستون username در صورت نیاز (برای سازگاری با نسخه‌های قبلی)
+    """
     conn = None
     try:
         conn = get_db_connection()
         with conn.cursor() as cursor:
+            # ایجاد جدول اگر وجود نداشته باشد
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS users (
-                    user_id BIGINT PRIMARY KEY
+                    user_id BIGINT PRIMARY KEY,
+                    username TEXT
                 );
             """)
+            # اضافه کردن ستون username اگر جدول از قبل وجود داشت و این ستون در آن نبود
+            cursor.execute("""
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT;
+            """)
             conn.commit()
-            print("✅ جدول کاربران با موفقیت ایجاد یا تایید شد.")
+            print("✅ جدول کاربران با موفقیت ایجاد یا به‌روزرسانی شد.")
     except Exception as e:
-        print(f"❌ خطا در ایجاد جدول دیتابیس: {e}")
+        print(f"❌ خطا در ایجاد/به‌روزرسانی جدول دیتابیس: {e}")
     finally:
         if conn:
             release_db_connection(conn)
 
-def save_user_id(user_id):
+def save_user_id(user_id, username):
     """
-    ذخیره شناسه کاربر در دیتابیس PostgreSQL
+    ذخیره شناسه کاربر و نام کاربری در دیتابیس PostgreSQL.
+    اگر کاربر وجود داشته باشد، نام کاربری او را آپدیت می‌کند.
     """
     conn = None
     try:
         conn = get_db_connection()
         with conn.cursor() as cursor:
-            # استفاده از دستور INSERT ... ON CONFLICT برای جلوگیری از خطا در صورت وجود کاربر
+            # استفاده از دستور INSERT ... ON CONFLICT برای افزودن یا به‌روزرسانی کاربر
             cursor.execute(
-                "INSERT INTO users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING;",
-                (user_id,)
+                "INSERT INTO users (user_id, username) VALUES (%s, %s) "
+                "ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username;",
+                (user_id, username)
             )
             conn.commit()
-            # بررسی اینکه آیا ردیف جدیدی اضافه شده است یا نه
-            if cursor.rowcount > 0:
-                print(f"✅ کاربر جدید ذخیره شد: {user_id}")
-            else:
-                print(f"ℹ️ کاربر از قبل وجود داشت: {user_id}")
+            print(f"✅ اطلاعات کاربر ذخیره/آپدیت شد: ID={user_id}, Username={username}")
     except Exception as e:
         print(f"❌ خطا در ذخیره کاربر {user_id}: {e}")
     finally:
@@ -96,16 +102,16 @@ def save_user_id(user_id):
 
 def get_all_users():
     """
-    دریافت لیست تمام کاربران از دیتابیس PostgreSQL
+    دریافت لیست تمام کاربران (ID و Username) از دیتابیس PostgreSQL
     """
     conn = None
     users = []
     try:
         conn = get_db_connection()
         with conn.cursor() as cursor:
-            cursor.execute("SELECT user_id FROM users;")
+            cursor.execute("SELECT user_id, username FROM users;")
             users_data = cursor.fetchall()
-            users = [user[0] for user in users_data]
+            users = users_data # لیستی از تاپل‌ها مانند [(123, 'user1'), (456, None)]
     except Exception as e:
         print(f"❌ خطا در خواندن لیست کاربران: {e}")
     finally:
@@ -605,9 +611,10 @@ def safe_send_document(chat_id, document, caption=None, retries=3):
 @bot.message_handler(commands=['start'])
 def start_handler(message):
     user_id = message.from_user.id
+    username = message.from_user.username # دریافت نام کاربری
     
-    # ذخیره شناسه کاربر در دیتابیس
-    save_user_id(user_id)
+    # ذخیره شناسه کاربر و نام کاربری در دیتابیس
+    save_user_id(user_id, username)
     
     # نمایش کیبورد انتخاب زبان
     lang_keyboard = telebot.types.InlineKeyboardMarkup()
@@ -644,7 +651,7 @@ def broadcast_handler(message):
         return
     
     broadcast_message = parts[1]
-    users = get_all_users()
+    users = get_all_users() # دریافت لیست (user_id, username)
     
     if not users:
         bot.send_message(user_id, TEXTS["fa"]["no_users"])
@@ -653,7 +660,7 @@ def broadcast_handler(message):
     success_count = 0
     failed_count = 0
     
-    for user_id in users:
+    for user_id, _ in users: # فقط user_id برای ارسال پیام کافی است
         try:
             safe_send_message(user_id, broadcast_message)
             success_count += 1
@@ -755,9 +762,12 @@ def callback_query_handler(call):
             return
         
         try:
-            # ایجاد یک فایل متنی موقت از لیست کاربران
+            # ایجاد یک فایل متنی موقت از لیست کاربران با فرمت خوانا
             users = get_all_users()
-            user_list_str = "\n".join(map(str, users))
+            # فرمت کردن هر کاربر به صورت "ID (@username)" یا فقط "ID" اگر نام کاربری وجود نداشت
+            user_list_str = "\n".join(
+                f"{uid} (@{uname})" if uname else str(uid) for uid, uname in users
+            )
             
             # ارسال فایل به عنوان یک سند
             bot.send_document(
