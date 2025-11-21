@@ -5,11 +5,13 @@ import hashlib
 import time
 from flask import Flask
 from threading import Thread
+# --- تغییرات مربوط به دیتابیس ---
+import psycopg2
+from psycopg2 import pool
 
 TELEGRAM_TOKEN = '7690534947:AAFf2YpBstmMoRkvlxKiSygKKssVBGwnEYo'
 OPENROUTER_API_KEY = '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'
-USERS_FILE = 'users.txt'
-LOCK_FILE = 'users.txt.lock'  # فایل قفل برای جلوگیری از دسترسی همزمان
+# USERS_FILE و LOCK_FILE دیگر مورد نیاز نیستند
 ADMIN_ID = 5403642668  # شناسه تلگرام ادمین (این را با شناسه خودتان جایگزین کنید)
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
@@ -21,6 +23,95 @@ app = Flask(__name__)
 @app.route('/')
 def index():
     return "Jaguar Bot is running!"
+
+# --- تغییرات مربوط به دیتابیس ---
+# یک Connection Pool برای مدیریت بهتر اتصالات به دیتابیس
+db_pool = None
+
+def get_db_connection():
+    """ایجاد یک اتصال به دیتابیس از طریق Connection Pool"""
+    global db_pool
+    if db_pool is None:
+        try:
+            # اطلاعات اتصال از متغیر محیطی DATABASE_URL خوانده می‌شود که Render به طور خودکار تنظیم می‌کند
+            database_url = os.getenv("DATABASE_URL")
+            if not database_url:
+                raise Exception("متغیر محیطی DATABASE_URL تنظیم نشده است.")
+            
+            db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, dsn=database_url)
+            print("✅ اتصال به دیتابیس با موفقیت برقرار شد.")
+        except Exception as e:
+            print(f"❌ خطا در اتصال به دیتابیس: {e}")
+            raise
+    return db_pool.getconn()
+
+def release_db_connection(conn):
+    """بازگرداندن اتصال به Pool"""
+    if db_pool and conn:
+        db_pool.putconn(conn)
+
+def init_db():
+    """ایجاد جدول کاربران در دیتابیس در صورت عدم وجود"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY
+                );
+            """)
+            conn.commit()
+            print("✅ جدول کاربران با موفقیت ایجاد یا تایید شد.")
+    except Exception as e:
+        print(f"❌ خطا در ایجاد جدول دیتابیس: {e}")
+    finally:
+        if conn:
+            release_db_connection(conn)
+
+def save_user_id(user_id):
+    """
+    ذخیره شناسه کاربر در دیتابیس PostgreSQL
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            # استفاده از دستور INSERT ... ON CONFLICT برای جلوگیری از خطا در صورت وجود کاربر
+            cursor.execute(
+                "INSERT INTO users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING;",
+                (user_id,)
+            )
+            conn.commit()
+            # بررسی اینکه آیا ردیف جدیدی اضافه شده است یا نه
+            if cursor.rowcount > 0:
+                print(f"✅ کاربر جدید ذخیره شد: {user_id}")
+            else:
+                print(f"ℹ️ کاربر از قبل وجود داشت: {user_id}")
+    except Exception as e:
+        print(f"❌ خطا در ذخیره کاربر {user_id}: {e}")
+    finally:
+        if conn:
+            release_db_connection(conn)
+
+def get_all_users():
+    """
+    دریافت لیست تمام کاربران از دیتابیس PostgreSQL
+    """
+    conn = None
+    users = []
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT user_id FROM users;")
+            users_data = cursor.fetchall()
+            users = [user[0] for user in users_data]
+    except Exception as e:
+        print(f"❌ خطا در خواندن لیست کاربران: {e}")
+    finally:
+        if conn:
+            release_db_connection(conn)
+    return users
 
 def run_bot():
     """تابعی برای اجرای ربات در یک Thread جداگانه با مدیریت خطای بهتر"""
@@ -171,7 +262,7 @@ TEXTS = {
         # پیام‌های مربوط به broadcast
         "broadcast_sent": "✅ پیام با موفقیت به {count} کاربر ارسال شد.",
         "broadcast_failed": "❌ ارسال پیام به {count} کاربر ناموفق بود.",
-        "no_users": "هیچ کاربری در فایل users.txt یافت نشد.",
+        "no_users": "هیچ کاربری در دیتابیس یافت نشد.",
         "admin_only": "⛔ این دستور فقط برای ادمین قابل استفاده است.",
         "broadcast_usage": "استفاده صحیح: /broadcast پیام شما",
         "download_users_button": "📄 دریافت لیست کاربران",
@@ -329,7 +420,7 @@ TEXTS = {
         # Broadcast messages
         "broadcast_sent": "✅ Message successfully sent to {count} users.",
         "broadcast_failed": "❌ Failed to send message to {count} users.",
-        "no_users": "No users found in users.txt file.",
+        "no_users": "No users found in the database.",
         "admin_only": "⛔ This command is only available to admins.",
         "broadcast_usage": "Usage: /broadcast your message",
         "download_users_button": "📄 Download User List",
@@ -511,92 +602,11 @@ def safe_send_document(chat_id, document, caption=None, retries=3):
                 print(f"Failed to send document after {retries} attempts: {e}")
                 raise
 
-def acquire_lock(lock_file_path, timeout=5):
-    """به دست آوردن قفل با استفاده از فایل قفل"""
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        try:
-            # تلاش برای ایجاد فایل قفل به صورت انحصاری
-            fd = os.open(lock_file_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            return fd
-        except OSError:
-            # اگر فایل وجود دارد، کمی صبر کن و دوباره تلاش کن
-            time.sleep(0.1)
-    return None
-
-def release_lock(fd, lock_file_path):
-    """رها کردن قفل"""
-    try:
-        os.close(fd)
-        os.remove(lock_file_path)
-    except OSError:
-        pass
-
-def save_user_id(user_id):
-    """
-    ذخیره شناسه کاربر در فایل با استفاده از فایل قفل (cross-platform)
-    """
-    user_id_str = str(user_id)
-    lock_fd = None
-    try:
-        # به دست آوردن قفل
-        lock_fd = acquire_lock(LOCK_FILE)
-        if lock_fd is None:
-            print(f"⚠️ Could not acquire lock to save user {user_id_str}")
-            return
-
-        # خواندن لیست کاربران موجود
-        existing_users = set()
-        if os.path.exists(USERS_FILE):
-            with open(USERS_FILE, 'r') as f:
-                existing_users = set(line.strip() for line in f if line.strip())
-        
-        # اگر کاربر جدید بود، اضافه‌اش کن
-        if user_id_str not in existing_users:
-            with open(USERS_FILE, 'a') as f:
-                f.write(f"{user_id_str}\n")
-            print(f"✅ New user saved: {user_id_str}")
-        else:
-            print(f"ℹ️ User already exists: {user_id_str}")
-
-    except Exception as e:
-        print(f"❌ Error saving user {user_id_str}: {e}")
-    finally:
-        # رها کردن قفل
-        if lock_fd is not None:
-            release_lock(lock_fd, LOCK_FILE)
-
-def get_all_users():
-    """
-    دریافت لیست تمام کاربران از فایل با استفاده از فایل قفل (cross-platform)
-    """
-    lock_fd = None
-    try:
-        # به دست آوردن قفل
-        lock_fd = acquire_lock(LOCK_FILE)
-        if lock_fd is None:
-            print("⚠️ Could not acquire lock to read users")
-            return []
-
-        users = []
-        if os.path.exists(USERS_FILE):
-            with open(USERS_FILE, 'r') as f:
-                users = [int(line.strip()) for line in f if line.strip().isdigit()]
-        
-        return users
-    except Exception as e:
-        print(f"❌ Error reading users: {e}")
-        return []
-    finally:
-        # رها کردن قفل
-        if lock_fd is not None:
-            release_lock(lock_fd, LOCK_FILE)
-
 @bot.message_handler(commands=['start'])
 def start_handler(message):
     user_id = message.from_user.id
     
-    # ذخیره شناسه کاربر
+    # ذخیره شناسه کاربر در دیتابیس
     save_user_id(user_id)
     
     # نمایش کیبورد انتخاب زبان
@@ -676,7 +686,7 @@ def stats_handler(message):
     
     stats_message = f"📊 آمار ربات:\n\n"
     stats_message += f"👥 تعداد کل کاربران: {total_users}\n"
-    stats_message += f"📁 فایل کاربران: {USERS_FILE}\n\n"
+    stats_message += f"💾 ذخیره‌سازی: دیتابیس PostgreSQL\n\n"
     stats_message += "برای دریافت لیست کامل کاربران، روی دکمه زیر کلیک کنید:"
     
     # ایجاد کیبورد اینلاین با دکمه دانلود
@@ -745,16 +755,17 @@ def callback_query_handler(call):
             return
         
         try:
-            # ارسال فایل users.txt به عنوان یک سند
-            with open(USERS_FILE, 'rb') as f:
-                safe_send_document(
-                    user_id, 
-                    f,
-                    caption=f"لیست کاربران ربات Jaguar\nتعداد: {len(get_all_users())} کاربر"
-                )
+            # ایجاد یک فایل متنی موقت از لیست کاربران
+            users = get_all_users()
+            user_list_str = "\n".join(map(str, users))
+            
+            # ارسال فایل به عنوان یک سند
+            bot.send_document(
+                user_id,
+                user_list_str.encode('utf-8'),
+                caption=f"لیست کاربران ربات Jaguar\nتعداد: {len(users)} کاربر"
+            )
             bot.answer_callback_query(call.id, TEXTS["fa"]["users_list_sent"])
-        except FileNotFoundError:
-            bot.answer_callback_query(call.id, "فایل کاربران یافت نشد.", show_alert=True)
         except Exception as e:
             print(f"Error sending users file: {e}")
             bot.answer_callback_query(call.id, "خطا در ارسال فایل.", show_alert=True)
@@ -1218,6 +1229,14 @@ def generate_request(user_input, category, language):
     return texts.get("unknown_error", "An unknown error occurred.")
 
 if __name__ == '__main__':
+    # --- تغییرات مربوط به دیتابیس ---
+    # ابتدا جدول دیتابیس را ایجاد یا بررسی کن
+    try:
+        init_db()
+    except Exception as e:
+        print(f"Fatal: Could not initialize database. Exiting. Error: {e}")
+        exit() # اگر دیتابیس آماده نباشد، برنامه نباید اجرا شود
+
     # اجرای ربات در یک Thread جداگانه
     bot_thread = Thread(target=run_bot)
     bot_thread.start()
