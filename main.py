@@ -10,7 +10,7 @@ TELEGRAM_TOKEN = '7690534947:AAFf2YpBstmMoRkvlxKiSygKKssVBGwnEYo'
 OPENROUTER_API_KEY = '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'
 USERS_FILE = 'users.txt'
 LOCK_FILE = 'users.txt.lock'  # فایل قفل برای جلوگیری از دسترسی همزمان
-ADMIN_ID = 123456789  # شناسه تلگرام ادمین (این را با شناسه خودتان جایگزین کنید)
+ADMIN_ID = 5403642668  # شناسه تلگرام ادمین (این را با شناسه خودتان جایگزین کنید)
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 user_states = {}
@@ -23,9 +23,34 @@ def index():
     return "Jaguar Bot is running!"
 
 def run_bot():
-    """تابعی برای اجرای ربات در یک Thread جداگانه"""
-    print("✅ ربات در حال اجراست.")
-    bot.infinity_polling()
+    """تابعی برای اجرای ربات در یک Thread جداگانه با مدیریت خطای بهتر"""
+    print("✅ ربات در حال اجراست...")
+    print("⚠️  نکته: مطمئن شوید که این نمونه از ربات تنها نمونه در حال اجراست.")
+    print("📡 در حال اتصال به سرورهای تلگرام...")
+    
+    # حلقه مدیریت خطا برای polling
+    while True:
+        try:
+            # استفاده از timeout و long_polling_timeout برای اتصال پایدارتر
+            bot.infinity_polling(timeout=60, long_polling_timeout=20, restart_on_change=False)
+        except telebot.apihelper.ApiTelegramException as e:
+            if e.error_code == 409:
+                print("❌ خطا 409: نمونه دیگری از ربات در حال اجراست!")
+                print("   لطفاً تمام نمونه‌های دیگر ربات را متوقف کنید.")
+                print("   در حال تلاش مجدد پس از 30 ثانیه...")
+                time.sleep(30)
+            else:
+                print(f"⚠️ خطای تلگرام: {e.description}")
+                print("   در حال تلاش مجدد پس از 10 ثانیه...")
+                time.sleep(10)
+        except requests.exceptions.ConnectionError as e:
+            print(f"🌐 خطای اتصال: {e}")
+            print("   در حال تلاش مجدد پس از 15 ثانیه...")
+            time.sleep(15)
+        except Exception as e:
+            print(f"💥 خطای پیش‌بینی نشده: {e}")
+            print("   در حال تلاش مجدد پس از 20 ثانیه...")
+            time.sleep(20)
 
 # دیکشنری برای نگهداری آدرس وب‌سایت ابزارهای هوش مصنوعی
 AI_TOOL_URLS = {
@@ -149,6 +174,8 @@ TEXTS = {
         "no_users": "هیچ کاربری در فایل users.txt یافت نشد.",
         "admin_only": "⛔ این دستور فقط برای ادمین قابل استفاده است.",
         "broadcast_usage": "استفاده صحیح: /broadcast پیام شما",
+        "download_users_button": "📄 دریافت لیست کاربران",
+        "users_list_sent": "✅ لیست کاربران با موفقیت ارسال شد.",
         # دستورالعمل و الگوهای تولید پرامپت
         "system_instruction": (
             "شما یک فرمت‌دهنده حرفه‌ای پرامپت هستید. "
@@ -231,7 +258,7 @@ TEXTS = {
                 "ورودی کاربر:\n{user_input}\n\n"
                 "دستور:\n"
                 "این ورودی را به یک پرامپت کوتاه و بسیار شفاف (۱–۲ جمله) تبدیل کن "
-                "که دقیقاً مشکل یا نیاز اصلی کاربر را برای یک دستیار متخصص توضیح دهد. "
+                "که دقیقا مشکل یا نیاز اصلی کاربر را برای یک دستیار متخصص توضیح دهد. "
                 "هیچ توضیح یا حاشیه اضافی نده. فقط پرامپت نهایی را برگردان."
             )
         }
@@ -305,6 +332,8 @@ TEXTS = {
         "no_users": "No users found in users.txt file.",
         "admin_only": "⛔ This command is only available to admins.",
         "broadcast_usage": "Usage: /broadcast your message",
+        "download_users_button": "📄 Download User List",
+        "users_list_sent": "✅ User list sent successfully.",
         # System instruction and prompt generation patterns
         "system_instruction": (
             "You are a professional prompt formatter. "
@@ -452,6 +481,36 @@ def ensure_code_block(text, language=""):
     # در غیر این صورت، کل متن را در یک بلوک کد قرار بده
     return f"```{language}\n{text}\n```"
 
+def safe_send_message(chat_id, text, reply_markup=None, parse_mode=None, retries=3):
+    """
+    ارسال امن پیام با مدیریت خطا و تلاش مجدد
+    """
+    for attempt in range(retries):
+        try:
+            return bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
+        except Exception as e:
+            print(f"Attempt {attempt + 1} failed: {e}")
+            if attempt < retries - 1:
+                time.sleep(2)  # صبر 2 ثانیه قبل از تلاش مجدد
+            else:
+                print(f"Failed to send message after {retries} attempts: {e}")
+                raise
+
+def safe_send_document(chat_id, document, caption=None, retries=3):
+    """
+    ارسال امن سند با مدیریت خطا و تلاش مجدد
+    """
+    for attempt in range(retries):
+        try:
+            return bot.send_document(chat_id, document, caption=caption)
+        except Exception as e:
+            print(f"Attempt {attempt + 1} failed: {e}")
+            if attempt < retries - 1:
+                time.sleep(2)  # صبر 2 ثانیه قبل از تلاش مجدد
+            else:
+                print(f"Failed to send document after {retries} attempts: {e}")
+                raise
+
 def acquire_lock(lock_file_path, timeout=5):
     """به دست آوردن قفل با استفاده از فایل قفل"""
     start_time = time.time()
@@ -547,8 +606,11 @@ def start_handler(message):
         telebot.types.InlineKeyboardButton(text="English", callback_data="lang_en")
     )
     
-    # ارسال پیام خوشامدگویی و درخواست انتخاب زبان
-    bot.send_message(user_id, TEXTS["fa"]["welcome"], reply_markup=lang_keyboard)
+    # ارسال پیام خوشامدگویی و درخواست انتخاب زبان با استفاده از توابع امن
+    try:
+        safe_send_message(user_id, TEXTS["fa"]["welcome"], reply_markup=lang_keyboard)
+    except Exception as e:
+        print(f"Error sending welcome message: {e}")
     
     # تنظیم وضعیت کاربر به انتظار برای انتخاب زبان
     user_states[user_id] = {"step": "awaiting_language"}
@@ -583,7 +645,7 @@ def broadcast_handler(message):
     
     for user_id in users:
         try:
-            bot.send_message(user_id, broadcast_message)
+            safe_send_message(user_id, broadcast_message)
             success_count += 1
             time.sleep(0.1)  # کمی تأخیر برای جلوگیری از محدودیت تلگرام
         except Exception as e:
@@ -600,7 +662,7 @@ def broadcast_handler(message):
 @bot.message_handler(commands=['stats'])
 def stats_handler(message):
     """
-    نمایش آمار کاربران (فقط برای ادمین)
+    نمایش آمار کاربران و امکان دریافت لیست کامل (فقط برای ادمین)
     """
     user_id = message.from_user.id
     
@@ -614,9 +676,17 @@ def stats_handler(message):
     
     stats_message = f"📊 آمار ربات:\n\n"
     stats_message += f"👥 تعداد کل کاربران: {total_users}\n"
-    stats_message += f"📁 فایل کاربران: {USERS_FILE}"
+    stats_message += f"📁 فایل کاربران: {USERS_FILE}\n\n"
+    stats_message += "برای دریافت لیست کامل کاربران، روی دکمه زیر کلیک کنید:"
     
-    bot.send_message(user_id, stats_message)
+    # ایجاد کیبورد اینلاین با دکمه دانلود
+    keyboard = telebot.types.InlineKeyboardMarkup()
+    keyboard.add(telebot.types.InlineKeyboardButton(
+        text=TEXTS["fa"]["download_users_button"], 
+        callback_data="download_users"
+    ))
+    
+    bot.send_message(user_id, stats_message, reply_markup=keyboard)
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query_handler(call):
@@ -664,6 +734,30 @@ def callback_query_handler(call):
             bot.answer_callback_query(call.id)
         else:
             bot.answer_callback_query(call.id, "خطا: بخش بعدی یافت نشد.", show_alert=True)
+    
+    # مدیریت کلیک روی دکمه دانلود کاربران
+    elif call.data == "download_users":
+        user_id = call.from_user.id
+        
+        # بررسی اینکه آیا کاربر ادمین است
+        if user_id != ADMIN_ID:
+            bot.answer_callback_query(call.id, TEXTS["fa"]["admin_only"], show_alert=True)
+            return
+        
+        try:
+            # ارسال فایل users.txt به عنوان یک سند
+            with open(USERS_FILE, 'rb') as f:
+                safe_send_document(
+                    user_id, 
+                    f,
+                    caption=f"لیست کاربران ربات Jaguar\nتعداد: {len(get_all_users())} کاربر"
+                )
+            bot.answer_callback_query(call.id, TEXTS["fa"]["users_list_sent"])
+        except FileNotFoundError:
+            bot.answer_callback_query(call.id, "فایل کاربران یافت نشد.", show_alert=True)
+        except Exception as e:
+            print(f"Error sending users file: {e}")
+            bot.answer_callback_query(call.id, "خطا در ارسال فایل.", show_alert=True)
     
     # مدیریت کلیک روی ابزارها
     elif call.data.startswith("tool_"):
