@@ -9,6 +9,8 @@ from threading import Thread
 TELEGRAM_TOKEN = '7690534947:AAFf2YpBstmMoRkvlxKiSygKKssVBGwnEYo'
 OPENROUTER_API_KEY = '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'
 USERS_FILE = 'users.txt'
+LOCK_FILE = 'users.txt.lock'  # فایل قفل برای جلوگیری از دسترسی همزمان
+ADMIN_ID = 123456789  # شناسه تلگرام ادمین (این را با شناسه خودتان جایگزین کنید)
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 user_states = {}
@@ -133,7 +135,7 @@ TEXTS = {
         "business_ai_button": "ابزارهای تخصصی و کسب‌وکار",
         # پیام‌های خطا
         "processing_error": "❌ خطا در پردازش درخواست",
-        "ai_communication_error": "❌ خطا در ارتباط ",
+        "ai_communication_error": "❌ خطا در ارتباط با هوش مصنوعی",
         # پیام‌های جدید برای باز کردن لینک
         "visit_website_message": "برای باز کردن وب‌سایت {tool_name} روی دکمه زیر کلیک کنید:",
         "visit_website_button": "باز کردن وب‌سایت",
@@ -141,6 +143,12 @@ TEXTS = {
         # پیام‌های جدید برای ویژگی تقسیم پیام
         "continue_button": "ادامه ▶️",
         "message_part_indicator": "(بخش {current}/{total})",
+        # پیام‌های مربوط به broadcast
+        "broadcast_sent": "✅ پیام با موفقیت به {count} کاربر ارسال شد.",
+        "broadcast_failed": "❌ ارسال پیام به {count} کاربر ناموفق بود.",
+        "no_users": "هیچ کاربری در فایل users.txt یافت نشد.",
+        "admin_only": "⛔ این دستور فقط برای ادمین قابل استفاده است.",
+        "broadcast_usage": "استفاده صحیح: /broadcast پیام شما",
         # دستورالعمل و الگوهای تولید پرامپت
         "system_instruction": (
             "شما یک فرمت‌دهنده حرفه‌ای پرامپت هستید. "
@@ -283,7 +291,7 @@ TEXTS = {
         "business_ai_button": "Business & Specialized",
         # Error messages
         "processing_error": "❌ Error processing request",
-        "ai_communication_error": "❌ Error",
+        "ai_communication_error": "❌ Error communicating with AI",
         # New messages for opening links
         "visit_website_message": "Click the button below to visit the {tool_name} website:",
         "visit_website_button": "Open Website",
@@ -291,6 +299,12 @@ TEXTS = {
         # New messages for splitting feature
         "continue_button": "Continue ▶️",
         "message_part_indicator": "(Part {current}/{total})",
+        # Broadcast messages
+        "broadcast_sent": "✅ Message successfully sent to {count} users.",
+        "broadcast_failed": "❌ Failed to send message to {count} users.",
+        "no_users": "No users found in users.txt file.",
+        "admin_only": "⛔ This command is only available to admins.",
+        "broadcast_usage": "Usage: /broadcast your message",
         # System instruction and prompt generation patterns
         "system_instruction": (
             "You are a professional prompt formatter. "
@@ -438,6 +452,87 @@ def ensure_code_block(text, language=""):
     # در غیر این صورت، کل متن را در یک بلوک کد قرار بده
     return f"```{language}\n{text}\n```"
 
+def acquire_lock(lock_file_path, timeout=5):
+    """به دست آوردن قفل با استفاده از فایل قفل"""
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            # تلاش برای ایجاد فایل قفل به صورت انحصاری
+            fd = os.open(lock_file_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            return fd
+        except OSError:
+            # اگر فایل وجود دارد، کمی صبر کن و دوباره تلاش کن
+            time.sleep(0.1)
+    return None
+
+def release_lock(fd, lock_file_path):
+    """رها کردن قفل"""
+    try:
+        os.close(fd)
+        os.remove(lock_file_path)
+    except OSError:
+        pass
+
+def save_user_id(user_id):
+    """
+    ذخیره شناسه کاربر در فایل با استفاده از فایل قفل (cross-platform)
+    """
+    user_id_str = str(user_id)
+    lock_fd = None
+    try:
+        # به دست آوردن قفل
+        lock_fd = acquire_lock(LOCK_FILE)
+        if lock_fd is None:
+            print(f"⚠️ Could not acquire lock to save user {user_id_str}")
+            return
+
+        # خواندن لیست کاربران موجود
+        existing_users = set()
+        if os.path.exists(USERS_FILE):
+            with open(USERS_FILE, 'r') as f:
+                existing_users = set(line.strip() for line in f if line.strip())
+        
+        # اگر کاربر جدید بود، اضافه‌اش کن
+        if user_id_str not in existing_users:
+            with open(USERS_FILE, 'a') as f:
+                f.write(f"{user_id_str}\n")
+            print(f"✅ New user saved: {user_id_str}")
+        else:
+            print(f"ℹ️ User already exists: {user_id_str}")
+
+    except Exception as e:
+        print(f"❌ Error saving user {user_id_str}: {e}")
+    finally:
+        # رها کردن قفل
+        if lock_fd is not None:
+            release_lock(lock_fd, LOCK_FILE)
+
+def get_all_users():
+    """
+    دریافت لیست تمام کاربران از فایل با استفاده از فایل قفل (cross-platform)
+    """
+    lock_fd = None
+    try:
+        # به دست آوردن قفل
+        lock_fd = acquire_lock(LOCK_FILE)
+        if lock_fd is None:
+            print("⚠️ Could not acquire lock to read users")
+            return []
+
+        users = []
+        if os.path.exists(USERS_FILE):
+            with open(USERS_FILE, 'r') as f:
+                users = [int(line.strip()) for line in f if line.strip().isdigit()]
+        
+        return users
+    except Exception as e:
+        print(f"❌ Error reading users: {e}")
+        return []
+    finally:
+        # رها کردن قفل
+        if lock_fd is not None:
+            release_lock(lock_fd, LOCK_FILE)
+
 @bot.message_handler(commands=['start'])
 def start_handler(message):
     user_id = message.from_user.id
@@ -457,6 +552,71 @@ def start_handler(message):
     
     # تنظیم وضعیت کاربر به انتظار برای انتخاب زبان
     user_states[user_id] = {"step": "awaiting_language"}
+
+@bot.message_handler(commands=['broadcast'])
+def broadcast_handler(message):
+    """
+    ارسال پیام به تمام کاربران (فقط برای ادمین)
+    """
+    user_id = message.from_user.id
+    
+    # بررسی اینکه آیا کاربر ادمین است
+    if user_id != ADMIN_ID:
+        bot.send_message(user_id, TEXTS["fa"]["admin_only"])
+        return
+    
+    # استخراج پیام از دستور
+    parts = message.text.split(' ', 1)
+    if len(parts) < 2:
+        bot.send_message(user_id, TEXTS["fa"]["broadcast_usage"])
+        return
+    
+    broadcast_message = parts[1]
+    users = get_all_users()
+    
+    if not users:
+        bot.send_message(user_id, TEXTS["fa"]["no_users"])
+        return
+    
+    success_count = 0
+    failed_count = 0
+    
+    for user_id in users:
+        try:
+            bot.send_message(user_id, broadcast_message)
+            success_count += 1
+            time.sleep(0.1)  # کمی تأخیر برای جلوگیری از محدودیت تلگرام
+        except Exception as e:
+            print(f"Failed to send message to {user_id}: {e}")
+            failed_count += 1
+    
+    # ارسال گزارش به ادمین
+    report = f"{TEXTS['fa']['broadcast_sent'].format(count=success_count)}"
+    if failed_count > 0:
+        report += f"\n{TEXTS['fa']['broadcast_failed'].format(count=failed_count)}"
+    
+    bot.send_message(message.from_user.id, report)
+
+@bot.message_handler(commands=['stats'])
+def stats_handler(message):
+    """
+    نمایش آمار کاربران (فقط برای ادمین)
+    """
+    user_id = message.from_user.id
+    
+    # بررسی اینکه آیا کاربر ادمین است
+    if user_id != ADMIN_ID:
+        bot.send_message(user_id, TEXTS["fa"]["admin_only"])
+        return
+    
+    users = get_all_users()
+    total_users = len(users)
+    
+    stats_message = f"📊 آمار ربات:\n\n"
+    stats_message += f"👥 تعداد کل کاربران: {total_users}\n"
+    stats_message += f"📁 فایل کاربران: {USERS_FILE}"
+    
+    bot.send_message(user_id, stats_message)
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query_handler(call):
@@ -871,12 +1031,12 @@ def chat_with_jaguar(user_input, language):
                     time.sleep(retry_delay)
                     continue
                 else:
-                    return {"text": texts["rate_limit_error"], "is_code_request": is_code_request}
+                    return {"text": texts.get("rate_limit_error", "Rate limit exceeded. Please try again later."), "is_code_request": is_code_request}
             elif response.status_code == 401 or response.status_code == 403:
-                return {"text": texts["invalid_api_key_error"], "is_code_request": is_code_request}
+                return {"text": texts.get("invalid_api_key_error", "Invalid API key."), "is_code_request": is_code_request}
             else:
                 print(f"API Error: Status Code {response.status_code}, Response: {response.text}")
-                return {"text": texts["api_server_error"], "is_code_request": is_code_request}
+                return {"text": texts.get("api_server_error", "API server error."), "is_code_request": is_code_request}
 
         except requests.exceptions.RequestException as e:
             print(f"Network Error: {e}")
@@ -885,12 +1045,12 @@ def chat_with_jaguar(user_input, language):
                 time.sleep(retry_delay)
                 continue
             else:
-                return {"text": texts["network_error"], "is_code_request": is_code_request}
+                return {"text": texts.get("network_error", "Network error."), "is_code_request": is_code_request}
         except Exception as e:
             print(f"An unexpected error occurred in chat_with_jaguar: {e}")
-            return {"text": texts["unknown_error"], "is_code_request": is_code_request}
+            return {"text": texts.get("unknown_error", "An unknown error occurred."), "is_code_request": is_code_request}
 
-    return {"text": texts["unknown_error"], "is_code_request": is_code_request}
+    return {"text": texts.get("unknown_error", "An unknown error occurred."), "is_code_request": is_code_request}
 
 def generate_request(user_input, category, language):
     """
@@ -944,10 +1104,10 @@ def generate_request(user_input, category, language):
                     time.sleep(retry_delay)
                     continue
                 else:
-                    return texts["rate_limit_error"]
+                    return texts.get("rate_limit_error", "Rate limit exceeded. Please try again later.")
             else:
                 print(f"API Error in generate_request: Status Code {response.status_code}, Response: {response.text}")
-                return texts["api_server_error"]
+                return texts.get("api_server_error", "API server error.")
 
         except requests.exceptions.RequestException as e:
             print(f"Network Error in generate_request: {e}")
@@ -956,28 +1116,12 @@ def generate_request(user_input, category, language):
                 time.sleep(retry_delay)
                 continue
             else:
-                return texts["network_error"]
+                return texts.get("network_error", "Network error.")
         except Exception as e:
             print(f"An unexpected error occurred in generate_request: {e}")
-            return texts["unknown_error"]
+            return texts.get("unknown_error", "An unknown error occurred.")
 
-    return texts["unknown_error"]
-
-def save_user_id(user_id):
-    """ذخیره شناسه کاربر در فایل برای جلوگیری از تکرار"""
-    try:
-        # خواندن لیست کاربران موجود
-        with open(USERS_FILE, 'r') as f:
-            existing_users = set(line.strip() for line in f)
-    except FileNotFoundError:
-        # اگر فایل وجود نداشت، لیست خالی در نظر بگیر
-        existing_users = set()
-
-    # اگر کاربر جدید بود، اضافه‌اش کن
-    if str(user_id) not in existing_users:
-        with open(USERS_FILE, 'a') as f:
-            f.write(f"{user_id}\n")
-        print(f"✅ New user saved: {user_id}")
+    return texts.get("unknown_error", "An unknown error occurred.")
 
 if __name__ == '__main__':
     # اجرای ربات در یک Thread جداگانه
