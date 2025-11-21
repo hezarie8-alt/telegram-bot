@@ -1,5 +1,10 @@
 import telebot
 import requests
+import os
+import hashlib
+import time
+from flask import Flask
+from threading import Thread
 
 TELEGRAM_TOKEN = '7690534947:AAFf2YpBstmMoRkvlxKiSygKKssVBGwnEYo'
 OPENROUTER_API_KEY = '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'
@@ -7,6 +12,18 @@ USERS_FILE = 'users.txt'
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 user_states = {}
+
+# ساخت یک اپلیکیشن ساده با Flask
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    return "Jaguar Bot is running!"
+
+def run_bot():
+    """تابعی برای اجرای ربات در یک Thread جداگانه"""
+    print("✅ ربات در حال اجراست.")
+    bot.infinity_polling()
 
 # دیکشنری برای نگهداری آدرس وب‌سایت ابزارهای هوش مصنوعی
 AI_TOOL_URLS = {
@@ -116,11 +133,14 @@ TEXTS = {
         "business_ai_button": "ابزارهای تخصصی و کسب‌وکار",
         # پیام‌های خطا
         "processing_error": "❌ خطا در پردازش درخواست",
-        "ai_communication_error": "❌ خطا در ارتباط با هوش مصنوعی",
+        "ai_communication_error": "❌ خطا در ارتباط ",
         # پیام‌های جدید برای باز کردن لینک
         "visit_website_message": "برای باز کردن وب‌سایت {tool_name} روی دکمه زیر کلیک کنید:",
         "visit_website_button": "باز کردن وب‌سایت",
         "tool_not_found": "متأسفانه، لینکی برای این ابزار پیدا نشد.",
+        # پیام‌های جدید برای ویژگی تقسیم پیام
+        "continue_button": "ادامه ▶️",
+        "message_part_indicator": "(بخش {current}/{total})",
         # دستورالعمل و الگوهای تولید پرامپت
         "system_instruction": (
             "شما یک فرمت‌دهنده حرفه‌ای پرامپت هستید. "
@@ -263,11 +283,14 @@ TEXTS = {
         "business_ai_button": "Business & Specialized",
         # Error messages
         "processing_error": "❌ Error processing request",
-        "ai_communication_error": "❌ Error communicating with AI",
+        "ai_communication_error": "❌ Error",
         # New messages for opening links
         "visit_website_message": "Click the button below to visit the {tool_name} website:",
         "visit_website_button": "Open Website",
         "tool_not_found": "Sorry, a link for this tool could not be found.",
+        # New messages for splitting feature
+        "continue_button": "Continue ▶️",
+        "message_part_indicator": "(Part {current}/{total})",
         # System instruction and prompt generation patterns
         "system_instruction": (
             "You are a professional prompt formatter. "
@@ -280,7 +303,7 @@ TEXTS = {
                 "simple": (
                     "User input:\n{user_input}\n\n"
                     "Instruction:\n"
-                    "Rewrite the input as a short 1–2 sentence prompt that clearly describes what code the assistant should generate. "
+                    "Rewrite the input as a short 1–2 sentence prompt that clearly describes what the code assistant should generate. "
                     "Do NOT write any code. Do NOT solve the problem. Only create the prompt that tells another AI what code to write. "
                     "Return only the final prompt."
                 ),
@@ -306,7 +329,7 @@ TEXTS = {
                 "User input:\n{user_input}\n\n"
                 "Instruction:\n"
                 "Turn this input into a detailed visual prompt for image generation. "
-                "Describe subject, style, composition, lighting, colors, and mood. "
+                "Describe the subject, style, composition, lighting, colors, and mood. "
                 "Do NOT generate or describe an actual image result—return only the final prompt."
             ),
 
@@ -389,6 +412,32 @@ def create_inline_keyboard(tools_list):
     
     return keyboard
 
+def ensure_code_block(text, language=""):
+    """
+    تابعی برای اطمینان از اینکه متن داخل بلوک کد قرار دارد
+    """
+    # اگر متن قبلاً داخل بلوک کد است، آن را برگردان
+    if text.startswith('```') and text.endswith('```'):
+        return text
+    
+    # اگر متن شامل بلوک کد است، آن را استخراج کن
+    if '```' in text:
+        parts = text.split('```')
+        if len(parts) >= 3:
+            # اولین بلوک کد را برگردان
+            code_content = parts[1]
+            # اگر اولین خط زبان است، آن را جدا کن
+            lines = code_content.split('\n')
+            if len(lines) > 1:
+                lang = lines[0].strip()
+                code = '\n'.join(lines[1:])
+                return f"```{lang}\n{code}\n```"
+            else:
+                return f"```\n{code_content}\n```"
+    
+    # در غیر این صورت، کل متن را در یک بلوک کد قرار بده
+    return f"```{language}\n{text}\n```"
+
 @bot.message_handler(commands=['start'])
 def start_handler(message):
     user_id = message.from_user.id
@@ -412,11 +461,11 @@ def start_handler(message):
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query_handler(call):
     """
-    مدیریت کلیک‌ها روی دکمه‌های اینلاین (انتخاب زبان و ابزارها)
+    مدیریت کلیک‌ها روی دکمه‌های اینلاین (انتخاب زبان، ابزارها و ادامه پیام)
     """
     user_id = call.from_user.id
     state = user_states.get(user_id, {})
-    lang = state.get("language", "fa") # Get language, default to fa
+    lang = state.get("language", "fa")
     texts = TEXTS[lang]
     
     # مدیریت انتخاب زبان
@@ -431,6 +480,30 @@ def callback_query_handler(call):
         
         # ارسال منوی دسته‌بندی‌ها با زبان انتخاب شده
         send_category_menu(user_id, selected_lang)
+    
+    # مدیریت کلیک روی دکمه "ادامه"
+    elif call.data.startswith("continue_"):
+        # بازیابی اطلاعات بخش بعدی از حافظه
+        next_chunk_index = state.get("next_chunk_index", 0)
+        all_chunks = state.get("message_chunks", [])
+        
+        if next_chunk_index < len(all_chunks):
+            next_chunk_text = all_chunks[next_chunk_index]
+            next_chunk_index += 1
+            
+            # به‌روزرسانی وضعیت کاربر
+            state["next_chunk_index"] = next_chunk_index
+            
+            # ساخت کیبورد برای بخش بعدی
+            keyboard = telebot.types.InlineKeyboardMarkup()
+            if next_chunk_index < len(all_chunks):
+                keyboard.add(telebot.types.InlineKeyboardButton(text=texts["continue_button"], callback_data=f"continue_{next_chunk_index}"))
+            
+            # ارسال بخش بعدی پیام
+            bot.send_message(user_id, next_chunk_text, reply_markup=keyboard)
+            bot.answer_callback_query(call.id)
+        else:
+            bot.answer_callback_query(call.id, "خطا: بخش بعدی یافت نشد.", show_alert=True)
     
     # مدیریت کلیک روی ابزارها
     elif call.data.startswith("tool_"):
@@ -581,21 +654,56 @@ def message_handler(message):
         bot.send_chat_action(user_id, 'typing')
         
         # دریافت پاسخ از Jaguar
-        response = chat_with_jaguar(user_input, lang)
+        response_data = chat_with_jaguar(user_input, lang)
         
-        # بررسی اینکه آیا پاسخ خالی است یا خیر
-        if not response or not response.strip():
-            # اگر پاسخ خالی بود، یک پیام خطای مناسب به کاربر نمایش بده
-            response = texts["jaguar_empty_response_error"]
-
+        response_text = response_data["text"]
+        is_code_request = response_data.get("is_code_request", False)
+        
+        # ساخت کیبورد بازگشت
         back_button = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
         back_button.row(texts["back_to_main"])
         
-        bot.send_message(
-            user_id,
-            response,
-            reply_markup=back_button
-        )
+        # اگر درخواست کد است، پاسخ را داخل بلوک کد قرار می‌دهیم
+        if is_code_request:
+            # تشخیص زبان کد
+            code_lang = ""
+            
+            # بررسی کلمات کلیدی برای تشخیص زبان
+            if any(keyword in user_input.lower() for keyword in ["python", "پایتون"]):
+                code_lang = "python"
+            elif any(keyword in user_input.lower() for keyword in ["javascript", "js", "جاوااسکریپت"]):
+                code_lang = "javascript"
+            elif any(keyword in user_input.lower() for keyword in ["java", "جاوا"]):
+                code_lang = "java"
+            elif any(keyword in user_input.lower() for keyword in ["cpp", "c++", "سی‌پلاس‌پلاس"]):
+                code_lang = "cpp"
+            elif any(keyword in user_input.lower() for keyword in ["c#", "سی‌شارپ"]):
+                code_lang = "csharp"
+            elif any(keyword in user_input.lower() for keyword in ["html", "css"]):
+                code_lang = "html"
+            elif any(keyword in user_input.lower() for keyword in ["sql", "اس‌کیوال"]):
+                code_lang = "sql"
+            elif any(keyword in user_input.lower() for keyword in ["c", "سی"]):
+                code_lang = "c"
+            
+            # اطمینان از اینکه پاسخ داخل بلوک کد است
+            formatted_response = ensure_code_block(response_text, code_lang)
+            
+            # ارسال پاسخ با فرمت کد
+            bot.send_message(
+                user_id,
+                formatted_response,
+                reply_markup=back_button,
+                parse_mode="Markdown"
+            )
+        else:
+            # ارسال پاسخ معمولی
+            bot.send_message(
+                user_id,
+                response_text,
+                reply_markup=back_button,
+                parse_mode=None
+            )
         return
 
     # مدیریت دسته‌بندی‌های اصلی
@@ -623,7 +731,8 @@ def message_handler(message):
         back_button = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
         back_button.row(texts["change_category"])
 
-        bot.send_message(user_id, f"`{escaped_prompt}`", parse_mode="MarkdownV2", reply_markup=back_button)
+        # ارسال پرامپت تولید شده داخل بلوک کد
+        bot.send_message(user_id, f"```\n{final_prompt}\n```", parse_mode="Markdown", reply_markup=back_button)
 
 def is_simple_task(text):
     import re
@@ -646,56 +755,142 @@ def is_simple_task(text):
 
 def chat_with_jaguar(user_input, language):
     """
-    چت با هوش مصنوعی Jaguar
+    چت با هوش مصنوعی Jaguar (با قابلیت تقسیم پیام طولانی)
     """
+    texts = TEXTS[language]
+    
     # دستورالعمل سیستم برای Jaguar
     if language == "fa":
+        base_system_instruction = (
+            "تو Jaguar هستی، یک دستیار هوش مصنوعی ساخته‌شده توسط Ehsan. "
+            "باید به سوالات کاربران دقیق، کوتاه و مفید پاسخ بدهی. "
+            "اگر از هویتت پرسیده شد، باید بگویی Jaguar هستی و توسط Ehsan ساخته شده‌ای. "
+            "اگر کاربر درخواست کد کرد، باید مستقیماً کد نهایی را فقط داخل یک code block سه‌تایی Markdown بدهی "
+            "و هیچ توضیح اضافی یا دکمه ادامه اضافه نکنی."
+        )
+        code_keywords = ["کد بنویس", "برام کد بنویس", "write code", "تابع بنویس", "برام تابع بنویس"]
+    else:
+        base_system_instruction = (
+            "You are Jaguar, an AI assistant created by Ehsan. "
+            "Your answers must be helpful, precise, and concise. "
+            "If the user asks for code, you must provide the final code directly inside a Markdown code block "
+            "with no extra explanation and no 'continue' button."
+        )
+        code_keywords = ["write code", "کد بنویس", "تابع بنویس"]
+
+    is_code_request = any(keyword in user_input.lower() for keyword in code_keywords)
+
+    if is_code_request:
         system_instruction = (
-            "شما Jaguar هستید، یک دستیار هوش مصنوعی که توسط Ehsan ساخته شده است. "
-            "شما باید به سوالات کاربران پاسخ دهید و اطلاعات مفید ارائه دهید. "
-            "اگر از شما در مورد هویت یا سازنده‌تان پرسیده شد، باید بگویید که Jaguar هستید و توسط Ehsan ساخته شده‌اید. "
-            "پاسخ‌های شما باید مفید، دقیق و دوستانه باشد."
+            base_system_instruction +
+            " "
+            "If the user requests code, you must output the exact code directly inside a Markdown code block "
+            "using triple backticks (```), with no escaping and no explanations. "
+            "Do NOT add buttons, do NOT describe how the code works, and do NOT generate prompts. "
+            "Only return the raw code the user asked for."
         )
     else:
-        system_instruction = (
-            "You are Jaguar, an AI assistant created by Ehsan. "
-            "You should answer users' questions and provide helpful information. "
-            "If asked about your identity or creator, you should say that you are Jaguar and were created by Ehsan. "
-            "Your responses should be helpful, accurate, and friendly."
-        )
-    
-    # ارسال درخواست به API هوش مصنوعی
-    try:
-        headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://jaguar.bot",
-            "X-Title": "Jaguar AI Assistant"
-        }
+        system_instruction = base_system_instruction
 
-        payload = {
-            "model": "google/gemma-2-9b-it",
-            "messages": [
-                {"role": "system", "content": system_instruction},
-                {"role": "user", "content": user_input}
-            ],
-            "max_tokens": 1000
-        }
+    max_retries = 2
+    retry_delay = 5  # 5 ثانیه
 
-        response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            json=payload
-        )
+    for attempt in range(max_retries):
+        try:
+            headers = {
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://jaguar.bot",
+                "X-Title": "Jaguar AI Assistant"
+            }
 
-        response_data = response.json()
-        return response_data['choices'][0]['message']['content'].strip()
+            payload = {
+                "model": "google/gemma-2-9b-it",
+                "messages": [
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": user_input}
+                ],
+                "max_tokens": 1500  # افزایش توکن برای پاسخ‌های طولانی‌تر
+            }
 
-    except Exception as e:
-        if language == "fa":
-            return f"❌ خطا در ارتباط با هوش مصنوعی: {str(e)}"
-        else:
-            return f"❌ Error communicating with AI: {str(e)}"
+            response = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=payload
+            )
+
+            if response.status_code == 200:
+                response_data = response.json()
+                ai_response = response_data['choices'][0]['message']['content'].strip()
+                
+                # تقسیم پاسخ طولانی به بخش‌های کوچکتر
+                max_message_length = 4000  # حداکثر طول پیام در تلگرام
+                
+                if len(ai_response) <= max_message_length:
+                    # اگر پاسخ کوتاه بود، آن را به صورت عادی برگردان
+                    return {
+                        "text": ai_response,
+                        "is_code_request": is_code_request
+                    }
+                else:
+                    # اگر پاسخ طولانی بود، آن را تقسیم و در حافظه ذخیره کن
+                    chunks = []
+                    current_chunk = ""
+                    for i, char in enumerate(ai_response):
+                        current_chunk += char
+                        if (i + 1) % max_message_length == 0 and len(current_chunk) >= max_message_length:
+                            chunks.append(current_chunk)
+                            current_chunk = ""
+                    if current_chunk:  # اضافه کردن آخرین بخش
+                        chunks.append(current_chunk)
+                    
+                    # ذخیره بخش‌ها در وضعیت کاربر
+                    user_id_str = str(message.from_user.id)
+                    user_states[user_id_str]["message_chunks"] = chunks
+                    user_states[user_id_str]["next_chunk_index"] = 1
+                    
+                    # ساخت کیبورد با دکمه ادامه
+                    keyboard = telebot.types.InlineKeyboardMarkup()
+                    keyboard.add(telebot.types.InlineKeyboardButton(
+                        text=texts["continue_button"], 
+                        callback_data=f"continue_1"
+                    ))
+                    
+                    # اضافه کردن شماره بخش به اولین پیام
+                    first_chunk_text = chunks[0] + f"\n\n{texts['message_part_indicator'].format(current=1, total=len(chunks))}"
+                    
+                    return {
+                        "text": first_chunk_text,
+                        "reply_markup": keyboard,
+                        "is_code_request": is_code_request
+                    }
+            
+            elif response.status_code == 429:  # 429 Too Many Requests
+                if attempt < max_retries - 1:
+                    print(f"Rate limit hit. Retrying in {retry_delay} seconds... (Attempt {attempt + 1}/{max_retries})")
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    return {"text": texts["rate_limit_error"], "is_code_request": is_code_request}
+            elif response.status_code == 401 or response.status_code == 403:
+                return {"text": texts["invalid_api_key_error"], "is_code_request": is_code_request}
+            else:
+                print(f"API Error: Status Code {response.status_code}, Response: {response.text}")
+                return {"text": texts["api_server_error"], "is_code_request": is_code_request}
+
+        except requests.exceptions.RequestException as e:
+            print(f"Network Error: {e}")
+            if attempt < max_retries - 1:
+                print(f"Network error. Retrying in {retry_delay} seconds... (Attempt {attempt + 1}/{max_retries})")
+                time.sleep(retry_delay)
+                continue
+            else:
+                return {"text": texts["network_error"], "is_code_request": is_code_request}
+        except Exception as e:
+            print(f"An unexpected error occurred in chat_with_jaguar: {e}")
+            return {"text": texts["unknown_error"], "is_code_request": is_code_request}
+
+    return {"text": texts["unknown_error"], "is_code_request": is_code_request}
 
 def generate_request(user_input, category, language):
     """
@@ -705,51 +900,68 @@ def generate_request(user_input, category, language):
     system_instruction = texts["system_instruction"]
     patterns = texts["patterns"]
 
-    # بررسی دسته‌بندی و ایجاد پرامپت مناسب
-    try:
-        if category == "👨‍💻 Code / Dev":
-            # برای دسته‌بندی کد، بررسی می‌کنیم که آیا وظیفه ساده است یا پیچیده
-            pattern = patterns[category]["simple"] if is_simple_task(user_input) else patterns[category]["complex"]
-            instruction = pattern.format(user_input=user_input)
-        elif category in patterns:
-            # برای سایر دسته‌بندی‌ها، از الگوی مربوطه استفاده می‌کنیم
-            instruction = patterns[category].format(user_input=user_input)
-        else:
-            # اگر دسته‌بندی نامشخص بود، از الگوی پیش‌فرض استفاده می‌کنیم
-            instruction = patterns["❓ Other"].format(user_input=user_input)
-    except Exception as e:
-        # در صورت بروز خطا، یک پیام خطای مناسب برمی‌گردانیم
-        return f"{texts['processing_error']}: {str(e)}"
+    max_retries = 2
+    retry_delay = 5  # 5 ثانیه
 
-    # ارسال درخواست به API هوش مصنوعی
-    try:
-        headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://jaguar.bot",
-            "X-Title": "Jaguar Request Formatter"
-        }
+    for attempt in range(max_retries):
+        try:
+            if category == "👨‍💻 Code / Dev":
+                pattern = patterns[category]["simple"] if is_simple_task(user_input) else patterns[category]["complex"]
+                instruction = pattern.format(user_input=user_input)
+            elif category in patterns:
+                instruction = patterns[category].format(user_input=user_input)
+            else:
+                instruction = patterns["❓ Other"].format(user_input=user_input)
+            
+            headers = {
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://jaguar.bot",
+                "X-Title": "Jaguar Request Formatter"
+            }
 
-        payload = {
-            "model": "google/gemma-2-9b-it",
-            "messages": [
-                {"role": "system", "content": system_instruction},
-                {"role": "user", "content": instruction}
-            ],
-            "max_tokens": 500
-        }
+            payload = {
+                "model": "google/gemma-2-9b-it",
+                "messages": [
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": instruction}
+                ],
+                "max_tokens": 500
+            }
 
-        response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            json=payload
-        )
+            response = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=payload
+            )
 
-        response_data = response.json()
-        return response_data['choices'][0]['message']['content'].strip()
+            if response.status_code == 200:
+                response_data = response.json()
+                return response_data['choices'][0]['message']['content'].strip()
+            elif response.status_code == 429:
+                if attempt < max_retries - 1:
+                    print(f"Rate limit hit in generate_request. Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    return texts["rate_limit_error"]
+            else:
+                print(f"API Error in generate_request: Status Code {response.status_code}, Response: {response.text}")
+                return texts["api_server_error"]
 
-    except Exception as e:
-        return f"{texts['ai_communication_error']}: {str(e)}"
+        except requests.exceptions.RequestException as e:
+            print(f"Network Error in generate_request: {e}")
+            if attempt < max_retries - 1:
+                print(f"Network error. Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+                continue
+            else:
+                return texts["network_error"]
+        except Exception as e:
+            print(f"An unexpected error occurred in generate_request: {e}")
+            return texts["unknown_error"]
+
+    return texts["unknown_error"]
 
 def save_user_id(user_id):
     """ذخیره شناسه کاربر در فایل برای جلوگیری از تکرار"""
@@ -768,5 +980,11 @@ def save_user_id(user_id):
         print(f"✅ New user saved: {user_id}")
 
 if __name__ == '__main__':
-    print("✅ ربات در حال اجراست.")
-    bot.infinity_polling()
+    # اجرای ربات در یک Thread جداگانه
+    bot_thread = Thread(target=run_bot)
+    bot_thread.start()
+    
+    # اجرای وب سرور Flask
+    # Render به طور خودکار پورت را از طریق متغیرهای محیطی مشخص می‌کند
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
