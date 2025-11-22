@@ -55,19 +55,9 @@ def init_db():
         conn = get_db_connection()
         with conn.cursor() as cursor:
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id BIGINT PRIMARY KEY,
-                    username VARCHAR(255),
-                    first_name VARCHAR(255),
-                    last_name VARCHAR(255),
-                    join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
-            
-            cursor.execute("""
                 SELECT column_name 
                 FROM information_schema.columns 
-                WHERE table_name = 'users' AND column_name = 'username';
+                WHERE table_name = 'users' AND column_name = 'join_date';
             """)
             if not cursor.fetchone():
                 print("🔧 در حال به‌روزرسانی ساختار دیتابیس برای افزودن ستون‌های جدید...")
@@ -76,11 +66,13 @@ def init_db():
                 cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name VARCHAR(255);")
                 cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP;")
                 print("✅ ساختار دیتابیس با موفقیت به‌روزرسانی شد.")
+            else:
+                print("✅ ساختار دیتابیس جدید است و نیازی به به‌روزرسانی ندارد.")
             
             conn.commit()
             print("✅ جدول کاربران با موفقیت ایجاد یا تایید شد.")
     except Exception as e:
-        print(f"❌ خطا در ایجاد جدول دیتابیس: {e}")
+        print(f"❌ خطا در ایجاد/به‌روزرسانی جدول دیتابیس: {e}")
     finally:
         if conn:
             release_db_connection(conn)
@@ -645,9 +637,11 @@ def broadcast_handler(message):
     bot.send_message(message.from_user.id, report)
 
 @bot.message_handler(commands=['stats'])
+@bot.message_handler(commands=['stats'])
 def stats_handler(message):
     """
     نمایش آمار کاربران و امکان دریافت لیست کامل (فقط برای ادمین)
+    این نسخه با دیتابیس قدیمی و جدید سازگار است.
     """
     user_id = message.from_user.id
     if user_id != ADMIN_ID:
@@ -658,33 +652,51 @@ def stats_handler(message):
     try:
         conn = get_db_connection()
         with conn.cursor() as cursor:
-            # دریافت تعداد کل کاربران
-            cursor.execute("SELECT COUNT(user_id) FROM users;")
-            total_users = cursor.fetchone()[0]
+            stats_message = ""
+            is_new_db = True
 
-            # دریافت ۱۰ کاربر آخر برای نمایش
-            cursor.execute("""
-                SELECT user_id, first_name, username 
-                FROM users 
-                ORDER BY join_date DESC 
-                LIMIT 10;
-            """)
-            recent_users_data = cursor.fetchall()
+            # تلاش برای اجرای کوئری جدید (برای دیتابیس به‌روز)
+            try:
+                cursor.execute("SELECT COUNT(user_id) FROM users;")
+                total_users = cursor.fetchone()[0]
 
-            stats_message = f"📊 **آمار ربات Jaguar:**\n\n"
-            stats_message += f"👥 **تعداد کل کاربران:** `{total_users}`\n"
-            stats_message += f"💾 **ذخیره‌سازی:** دیتابیس PostgreSQL\n\n"
-            stats_message += "📋 **آخرین کاربران عضو شده:**\n"
+                cursor.execute("""
+                    SELECT user_id, first_name, username 
+                    FROM users 
+                    ORDER BY join_date DESC NULLS LAST
+                    LIMIT 10;
+                """)
+                recent_users_data = cursor.fetchall()
 
-            if not recent_users_data:
-                stats_message += "هیچ کاربری یافت نشد."
-            else:
-                for user_row in recent_users_data:
-                    uid, first_name, username = user_row
-                    # نمایش نام کاربری در صورت وجود
-                    user_tag = f"@{username}" if username else "بدون نام کاربری"
-                    stats_message += f"  - {first_name} ({user_tag}) - ID: `{uid}`\n"
+                stats_message = f"📊 **آمار ربات Jaguar:**\n\n"
+                stats_message += f"👥 **تعداد کل کاربران:** `{total_users}`\n"
+                stats_message += f"💾 **ذخیره‌سازی:** دیتابیس PostgreSQL\n\n"
+                stats_message += "📋 **آخرین کاربران عضو شده:**\n"
+
+                if not recent_users_data:
+                    stats_message += "هیچ کاربری یافت نشد."
+                else:
+                    for user_row in recent_users_data:
+                        uid, first_name, username = user_row
+                        user_tag = f"@{username}" if username else "بدون نام کاربری"
+                        stats_message += f"  - {first_name} ({user_tag}) - ID: `{uid}`\n"
+
+            except psycopg2.errors.UndefinedColumn:
+                print("⚠️ ستون‌های جدید در دیتابیس یافت نشد. نمایش آمار به صورت قدیمی.")
+                is_new_db = False
+                cursor.execute("SELECT user_id FROM users;")
+                all_user_ids = [row[0] for row in cursor.fetchall()]
+                total_users = len(all_user_ids)
+
+                stats_message = f"📊 **آمار ربات Jaguar (حالت سازگاری):**\n\n"
+                stats_message += f"👥 **تعداد کل کاربران:** `{total_users}`\n"
+                stats_message += f"💾 **ذخیره‌سازی:** دیتابیس PostgreSQL\n\n"
+                stats_message += "⚠️ **توجه:** ساختار دیتابیس شما قدیمی است و برای نمایش اطلاعات کامل نیاز به به‌روزرسانی دارد.\n"
+                stats_message += "📋 **نمونه‌ای از شناسه کاربران:**\n"
+                for uid in all_user_ids[:10]:
+                    stats_message += f"  - ID: `{uid}`\n"
             
+            # دکمه دانلود لیست کاربران همیشه نمایش داده می‌شود
             keyboard = telebot.types.InlineKeyboardMarkup()
             keyboard.add(telebot.types.InlineKeyboardButton(
                 text=TEXTS["fa"]["download_users_button"], 
@@ -695,7 +707,7 @@ def stats_handler(message):
 
     except Exception as e:
         print(f"❌ خطا در دریافت آمار: {e}")
-        bot.send_message(user_id, "خطایی در دریافت آمار رخ داد.")
+        bot.send_message(user_id, "خطایی در ارتباط با دیتابیس رخ داد. لطفاً بعداً تلاش کنید.")
     finally:
         if conn:
             release_db_connection(conn)
