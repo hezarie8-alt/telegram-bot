@@ -49,16 +49,34 @@ def release_db_connection(conn):
         db_pool.putconn(conn)
 
 def init_db():
-    """ایجاد جدول کاربران در دیتابیس در صورت عدم وجود"""
+    """ایجاد یا به‌روزرسانی جدول کاربران در دیتابیس"""
     conn = None
     try:
         conn = get_db_connection()
         with conn.cursor() as cursor:
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS users (
-                    user_id BIGINT PRIMARY KEY
+                    user_id BIGINT PRIMARY KEY,
+                    username VARCHAR(255),
+                    first_name VARCHAR(255),
+                    last_name VARCHAR(255),
+                    join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
+            
+            cursor.execute("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'users' AND column_name = 'username';
+            """)
+            if not cursor.fetchone():
+                print("🔧 در حال به‌روزرسانی ساختار دیتابیس برای افزودن ستون‌های جدید...")
+                cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(255);")
+                cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name VARCHAR(255);")
+                cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name VARCHAR(255);")
+                cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP;")
+                print("✅ ساختار دیتابیس با موفقیت به‌روزرسانی شد.")
+            
             conn.commit()
             print("✅ جدول کاربران با موفقیت ایجاد یا تایید شد.")
     except Exception as e:
@@ -67,25 +85,31 @@ def init_db():
         if conn:
             release_db_connection(conn)
 
-def save_user_id(user_id):
+def save_user_info(user):
     """
-    ذخیره شناسه کاربر در دیتابیس PostgreSQL
+    ذخیره اطلاعات کامل کاربر در دیتابیس PostgreSQL.
+    اگر کاربر از قبل وجود داشته باشد، اطلاعات او را به‌روزرسانی می‌کند.
     """
     conn = None
     try:
         conn = get_db_connection()
         with conn.cursor() as cursor:
             cursor.execute(
-                "INSERT INTO users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING;",
-                (user_id,)
+                """
+                INSERT INTO users (user_id, username, first_name, last_name) 
+                VALUES (%s, %s, %s, %s) 
+                ON CONFLICT (user_id) 
+                DO UPDATE SET 
+                    username = EXCLUDED.username,
+                    first_name = EXCLUDED.first_name,
+                    last_name = EXCLUDED.last_name;
+                """,
+                (user.id, user.username, user.first_name, user.last_name)
             )
             conn.commit()
-            if cursor.rowcount > 0:
-                print(f"✅ کاربر جدید ذخیره شد: {user_id}")
-            else:
-                print(f"ℹ️ کاربر از قبل وجود داشت: {user_id}")
+            print(f"✅ اطلاعات کاربر {user.id} ({user.first_name}) ذخیره یا به‌روزرسانی شد.")
     except Exception as e:
-        print(f"❌ خطا در ذخیره کاربر {user_id}: {e}")
+        print(f"❌ خطا در ذخیره اطلاعات کاربر {user.id}: {e}")
     finally:
         if conn:
             release_db_connection(conn)
@@ -569,18 +593,18 @@ def safe_send_document(chat_id, document, caption=None, retries=3):
 
 @bot.message_handler(commands=['start'])
 def start_handler(message):
-    user_id = message.from_user.id
-    save_user_id(user_id)
+    user = message.from_user
+    save_user_info(user) # <<< CHANGE: فراخوانی تابع جدید
     lang_keyboard = telebot.types.InlineKeyboardMarkup()
     lang_keyboard.row(
         telebot.types.InlineKeyboardButton(text="فارسی", callback_data="lang_fa"),
         telebot.types.InlineKeyboardButton(text="English", callback_data="lang_en")
     )
     try:
-        safe_send_message(user_id, TEXTS["fa"]["welcome"], reply_markup=lang_keyboard)
+        safe_send_message(user.id, TEXTS["fa"]["welcome"], reply_markup=lang_keyboard)
     except Exception as e:
         print(f"Error sending welcome message: {e}")
-    user_states[user_id] = {"step": "awaiting_language"}
+    user_states[user.id] = {"step": "awaiting_language"}
 
 @bot.message_handler(commands=['broadcast'])
 def broadcast_handler(message):
@@ -606,13 +630,13 @@ def broadcast_handler(message):
     success_count = 0
     failed_count = 0
     
-    for user_id in users:
+    for uid in users:
         try:
-            safe_send_message(user_id, broadcast_message)
+            safe_send_message(uid, broadcast_message)
             success_count += 1
             time.sleep(0.1)
         except Exception as e:
-            print(f"Failed to send message to {user_id}: {e}")
+            print(f"Failed to send message to {uid}: {e}")
             failed_count += 1
     report = f"{TEXTS['fa']['broadcast_sent'].format(count=success_count)}"
     if failed_count > 0:
@@ -630,20 +654,52 @@ def stats_handler(message):
         bot.send_message(user_id, TEXTS["fa"]["admin_only"])
         return
     
-    users = get_all_users()
-    total_users = len(users)
-    
-    stats_message = f"📊 آمار ربات:\n\n"
-    stats_message += f"👥 تعداد کل کاربران: {total_users}\n"
-    stats_message += f"💾 ذخیره‌سازی: دیتابیس PostgreSQL\n\n"
-    stats_message += "برای دریافت لیست کامل کاربران، روی دکمه زیر کلیک کنید:"
-    keyboard = telebot.types.InlineKeyboardMarkup()
-    keyboard.add(telebot.types.InlineKeyboardButton(
-        text=TEXTS["fa"]["download_users_button"], 
-        callback_data="download_users"
-    ))
-    
-    bot.send_message(user_id, stats_message, reply_markup=keyboard)
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            # دریافت تعداد کل کاربران
+            cursor.execute("SELECT COUNT(user_id) FROM users;")
+            total_users = cursor.fetchone()[0]
+
+            # دریافت ۱۰ کاربر آخر برای نمایش
+            cursor.execute("""
+                SELECT user_id, first_name, username 
+                FROM users 
+                ORDER BY join_date DESC 
+                LIMIT 10;
+            """)
+            recent_users_data = cursor.fetchall()
+
+            stats_message = f"📊 **آمار ربات Jaguar:**\n\n"
+            stats_message += f"👥 **تعداد کل کاربران:** `{total_users}`\n"
+            stats_message += f"💾 **ذخیره‌سازی:** دیتابیس PostgreSQL\n\n"
+            stats_message += "📋 **آخرین کاربران عضو شده:**\n"
+
+            if not recent_users_data:
+                stats_message += "هیچ کاربری یافت نشد."
+            else:
+                for user_row in recent_users_data:
+                    uid, first_name, username = user_row
+                    # نمایش نام کاربری در صورت وجود
+                    user_tag = f"@{username}" if username else "بدون نام کاربری"
+                    stats_message += f"  - {first_name} ({user_tag}) - ID: `{uid}`\n"
+            
+            keyboard = telebot.types.InlineKeyboardMarkup()
+            keyboard.add(telebot.types.InlineKeyboardButton(
+                text=TEXTS["fa"]["download_users_button"], 
+                callback_data="download_users"
+            ))
+            
+            bot.send_message(user_id, stats_message, reply_markup=keyboard, parse_mode="Markdown")
+
+    except Exception as e:
+        print(f"❌ خطا در دریافت آمار: {e}")
+        bot.send_message(user_id, "خطایی در دریافت آمار رخ داد.")
+    finally:
+        if conn:
+            release_db_connection(conn)
+
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query_handler(call):
@@ -728,7 +784,6 @@ def send_category_menu(user_id, lang):
         parse_mode="Markdown"
     )
 
-# --- شروع بخش امنیتی: تابع و فراخوانی محدودیت نرخ ---
 def is_rate_limited(user_id):
     """بررسی می‌کند که آیا کاربر از محدودیت نرخ عبور کرده است یا خیر."""
     current_time = time.time()
@@ -755,13 +810,11 @@ def is_rate_limited(user_id):
 def message_handler(message):
     user_id = message.from_user.id
     
-    # بررسی محدودیت نرخ
     if is_rate_limited(user_id):
         bot.send_message(user_id, "⏳ شما در حال حاضر درخواست‌های زیادی ارسال کرده‌اید. لطفاً پس از مدتی دوباره تلاش کنید.")
         return
     
     state = user_states.get(user_id, {})
-# --- پایان بخش امنیتی ---
 
     if not state or "language" not in state:
         return
@@ -977,7 +1030,7 @@ def chat_with_jaguar(user_input, language):
         system_instruction = base_system_instruction
 
     max_retries = 2
-    retry_delay = 5  # 5 ثانیه
+    retry_delay = 5
 
     for attempt in range(max_retries):
         try:
@@ -994,7 +1047,7 @@ def chat_with_jaguar(user_input, language):
                     {"role": "system", "content": system_instruction},
                     {"role": "user", "content": user_input}
                 ],
-                "max_tokens": 1500  # افزایش توکن برای پاسخ‌های طولانی‌تر
+                "max_tokens": 1500
             }
 
             response = requests.post(
@@ -1007,7 +1060,7 @@ def chat_with_jaguar(user_input, language):
                 response_data = response.json()
                 ai_response = response_data['choices'][0]['message']['content'].strip()
                 
-                max_message_length = 4000  # حداکثر طول پیام در تلگرام
+                max_message_length = 4000
                 
                 if len(ai_response) <= max_message_length:
                     return {
@@ -1137,8 +1190,13 @@ def generate_request(user_input, category, language):
             else:
                 return texts.get("network_error", "Network error.")
         except Exception as e:
-            print(f"An unexpected error occurred in generate_request")
-            return texts.get("unknown_error", "An unknown error occurred.")
+            print(f"An unexpected error occurred in generate_request: {e}")
+            if attempt < max_retries - 1:
+                print(f"Unexpected error. Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+                continue
+            else:
+                return texts.get("unknown_error", "An unknown error occurred.")
 
     return texts.get("unknown_error", "An unknown error occurred.")
 
