@@ -5,26 +5,26 @@ import hashlib
 import time
 from flask import Flask
 from threading import Thread
-# --- تغییرات مربوط به دیتابیس ---
 import psycopg2
 from psycopg2 import pool
 
-TELEGRAM_TOKEN = '7690534947:AAFf2YpBstmMoRkvlxKiSygKKssVBGwnEYo'
-OPENROUTER_API_KEY = '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'
-ADMIN_ID = 5403642668  # شناسه تلگرام ادمین (این را با شناسه خودتان جایگزین کنید)
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
+ADMIN_ID = int(os.getenv('ADMIN_ID'))
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 user_states = {}
 
-# ساخت یک اپلیکیشن ساده با Flask
+user_request_counts = {}
+RATE_LIMIT_SECONDS = 60
+RATE_LIMIT_COUNT = 10
+
 app = Flask(__name__)
 
 @app.route('/')
 def index():
     return "Jaguar Bot is running!"
 
-# --- تغییرات مربوط به دیتابیس ---
-# یک Connection Pool برای مدیریت بهتر اتصالات به دیتابیس
 db_pool = None
 
 def get_db_connection():
@@ -32,7 +32,6 @@ def get_db_connection():
     global db_pool
     if db_pool is None:
         try:
-            # اطلاعات اتصال از متغیر محیطی DATABASE_URL خوانده می‌شود که Render به طور خودکار تنظیم می‌کند
             database_url = os.getenv("DATABASE_URL")
             if not database_url:
                 raise Exception("متغیر محیطی DATABASE_URL تنظیم نشده است.")
@@ -50,50 +49,41 @@ def release_db_connection(conn):
         db_pool.putconn(conn)
 
 def init_db():
-    """
-    ایجاد جدول کاربران در دیتابیس در صورت عدم وجود
-    و اضافه کردن ستون username در صورت نیاز (برای سازگاری با نسخه‌های قبلی)
-    """
+    """ایجاد جدول کاربران در دیتابیس در صورت عدم وجود"""
     conn = None
     try:
         conn = get_db_connection()
         with conn.cursor() as cursor:
-            # ایجاد جدول اگر وجود نداشته باشد
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS users (
-                    user_id BIGINT PRIMARY KEY,
-                    username TEXT
+                    user_id BIGINT PRIMARY KEY
                 );
             """)
-            # اضافه کردن ستون username اگر جدول از قبل وجود داشت و این ستون در آن نبود
-            cursor.execute("""
-                ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT;
-            """)
             conn.commit()
-            print("✅ جدول کاربران با موفقیت ایجاد یا به‌روزرسانی شد.")
+            print("✅ جدول کاربران با موفقیت ایجاد یا تایید شد.")
     except Exception as e:
-        print(f"❌ خطا در ایجاد/به‌روزرسانی جدول دیتابیس: {e}")
+        print(f"❌ خطا در ایجاد جدول دیتابیس: {e}")
     finally:
         if conn:
             release_db_connection(conn)
 
-def save_user_id(user_id, username):
+def save_user_id(user_id):
     """
-    ذخیره شناسه کاربر و نام کاربری در دیتابیس PostgreSQL.
-    اگر کاربر وجود داشته باشد، نام کاربری او را آپدیت می‌کند.
+    ذخیره شناسه کاربر در دیتابیس PostgreSQL
     """
     conn = None
     try:
         conn = get_db_connection()
         with conn.cursor() as cursor:
-            # استفاده از دستور INSERT ... ON CONFLICT برای افزودن یا به‌روزرسانی کاربر
             cursor.execute(
-                "INSERT INTO users (user_id, username) VALUES (%s, %s) "
-                "ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username;",
-                (user_id, username)
+                "INSERT INTO users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING;",
+                (user_id,)
             )
             conn.commit()
-            print(f"✅ اطلاعات کاربر ذخیره/آپدیت شد: ID={user_id}, Username={username}")
+            if cursor.rowcount > 0:
+                print(f"✅ کاربر جدید ذخیره شد: {user_id}")
+            else:
+                print(f"ℹ️ کاربر از قبل وجود داشت: {user_id}")
     except Exception as e:
         print(f"❌ خطا در ذخیره کاربر {user_id}: {e}")
     finally:
@@ -102,16 +92,16 @@ def save_user_id(user_id, username):
 
 def get_all_users():
     """
-    دریافت لیست تمام کاربران (ID و Username) از دیتابیس PostgreSQL
+    دریافت لیست تمام کاربران از دیتابیس PostgreSQL
     """
     conn = None
     users = []
     try:
         conn = get_db_connection()
         with conn.cursor() as cursor:
-            cursor.execute("SELECT user_id, username FROM users;")
+            cursor.execute("SELECT user_id FROM users;")
             users_data = cursor.fetchall()
-            users = users_data # لیستی از تاپل‌ها مانند [(123, 'user1'), (456, None)]
+            users = [user[0] for user in users_data]
     except Exception as e:
         print(f"❌ خطا در خواندن لیست کاربران: {e}")
     finally:
@@ -125,10 +115,8 @@ def run_bot():
     print("⚠️  نکته: مطمئن شوید که این نمونه از ربات تنها نمونه در حال اجراست.")
     print("📡 در حال اتصال به سرورهای تلگرام...")
     
-    # حلقه مدیریت خطا برای polling
     while True:
         try:
-            # استفاده از timeout و long_polling_timeout برای اتصال پایدارتر
             bot.infinity_polling(timeout=60, long_polling_timeout=20, restart_on_change=False)
         except telebot.apihelper.ApiTelegramException as e:
             if e.error_code == 409:
@@ -149,9 +137,18 @@ def run_bot():
             print("   در حال تلاش مجدد پس از 20 ثانیه...")
             time.sleep(20)
 
-# دیکشنری برای نگهداری آدرس وب‌سایت ابزارهای هوش مصنوعی
+def validate_environment():
+    """بررسی می‌کند که آیا تمام متغیرهای محیطی لازم تنظیم شده‌اند یا خیر."""
+    required_vars = ['TELEGRAM_TOKEN', 'OPENROUTER_API_KEY', 'ADMIN_ID', 'DATABASE_URL']
+    missing_vars = [var for var in required_vars if not os.getenv(var)]
+    
+    if missing_vars:
+        error_message = f"❌ خطا: متغیرهای محیطی زیر تنظیم نشده‌اند: {', '.join(missing_vars)}"
+        print(error_message)
+        raise Exception(error_message)
+
+
 AI_TOOL_URLS = {
-    # LLM Models
     "GPT": "https://chat.openai.com",
     "Claude": "https://claude.ai",
     "Gemini": "https://gemini.google.com",
@@ -161,7 +158,6 @@ AI_TOOL_URLS = {
     "Command R+": "https://cohere.com/command",
     "Cohere": "https://cohere.com",
 
-    # Code/Dev Tools
     "GitHub Copilot": "https://github.com/features/copilot",
     "CodeLlama": "https://llama.meta.com/docs/model-cards-and-releases/code-llama",
     "Amazon CodeWhisperer": "https://aws.amazon.com/codewhisperer",
@@ -169,38 +165,33 @@ AI_TOOL_URLS = {
     "Replit Ghostwriter": "https://replit.com/site/ai",
     "Z": "https://z.dev",
 
-    # Image/Art Tools
     "Midjourney": "https://www.midjourney.com",
     "DALL-E": "https://openai.com/dall-e-3",
     "Stable Diffusion": "https://stability.ai",
     "Adobe Firefly": "https://firefly.adobe.com",
     "Ideogram": "https://ideogram.ai",
 
-    # Audio/Music Tools
     "Suno": "https://suno.com",
     "Udio": "https://www.udio.com",
     "ElevenLabs": "https://elevenlabs.io",
     "Murf": "https://murf.ai",
     "AIVA": "https://www.aiva.ai",
 
-    # Video Tools
     "Sora": "https://openai.com/sora",
-    "Gemini": "https://gemini.google.com", # This is a duplicate, but it's also a video tool
+    "Gemini": "https://gemini.google.com",
     "Pika Labs": "https://pika.art",
     "Runway Gen": "https://runwayml.com",
     "HeyGen": "https://www.heygen.com",
     "Synthesia": "https://www.synthesia.io",
 
-    # Business Tools
     "Perplexity": "https://www.perplexity.ai",
     "kimi": "https://kimi.moonshot.cn",
     "Jasper": "https://www.jasper.ai",
-    "Z": "https://z.dev", # Duplicate, but also a business tool
+    "Z": "https://z.dev",
     "Gamma": "https://gamma.app",
     "Zapier Central": "https://zapier.com/central",
 }
 
-# دیکشنری برای نگهداری تمام متن‌ها در دو زبان
 TEXTS = {
     "fa": {
         "jaguar_button": "🤖 Jaguar AI",
@@ -240,7 +231,6 @@ TEXTS = {
         "audio_music_tools_title": "ابزارهای تولید صدا و موسیقی:",
         "video_tools_title": "ابزارهای تولید ویدیو:",
         "business_tools_title": "ابزارهای تخصصی و کسب‌وکار:",
-        # دسته‌بندی‌ها
         "best_ai_button": "Best AI",
         "writing_button": "📚 Writing",
         "art_image_button": "🎨 Image",
@@ -248,24 +238,22 @@ TEXTS = {
         "business_button": "📈 Business",
         "brainstorm_button": "🧠 Brainstorm",
         "other_button": "❓ Other",
-        # زیرمجموعه‌های Best AI
+
         "chat_models_button": "گفت و گو",
         "code_dev_ai_button": "کدنویسی و توسعه",
         "image_art_ai_button": "تصویر و هنر",
         "audio_music_ai_button": "صدا و موسیقی",
         "video_ai_button": "تولید ویدیو",
         "business_ai_button": "ابزارهای تخصصی و کسب‌وکار",
-        # پیام‌های خطا
+
         "processing_error": "❌ خطا در پردازش درخواست",
-        "ai_communication_error": "❌ خطا در ارتباط با هوش مصنوعی",
-        # پیام‌های جدید برای باز کردن لینک
+        "ai_communication_error": "❌ خطا در ارتباط",
+
         "visit_website_message": "برای باز کردن وب‌سایت {tool_name} روی دکمه زیر کلیک کنید:",
         "visit_website_button": "باز کردن وب‌سایت",
         "tool_not_found": "متأسفانه، لینکی برای این ابزار پیدا نشد.",
-        # پیام‌های جدید برای ویژگی تقسیم پیام
         "continue_button": "ادامه ▶️",
         "message_part_indicator": "(بخش {current}/{total})",
-        # پیام‌های مربوط به broadcast
         "broadcast_sent": "✅ پیام با موفقیت به {count} کاربر ارسال شد.",
         "broadcast_failed": "❌ ارسال پیام به {count} کاربر ناموفق بود.",
         "no_users": "هیچ کاربری در دیتابیس یافت نشد.",
@@ -273,7 +261,6 @@ TEXTS = {
         "broadcast_usage": "استفاده صحیح: /broadcast پیام شما",
         "download_users_button": "📄 دریافت لیست کاربران",
         "users_list_sent": "✅ لیست کاربران با موفقیت ارسال شد.",
-        # دستورالعمل و الگوهای تولید پرامپت
         "system_instruction": (
             "شما یک فرمت‌دهنده حرفه‌ای پرامپت هستید. "
             "وظیفه شما بازنویسی ورودی کاربر به یک دستور واضح، دقیق و مختصر برای یک دستیار هوش مصنوعی تخصصی است. "
@@ -398,7 +385,6 @@ TEXTS = {
         "audio_music_tools_title": "Audio & Music Generation Tools:",
         "video_tools_title": "Video Generation Tools:",
         "business_tools_title": "Specialized & Business Tools:",
-        # Categories
         "best_ai_button": "Best AI",
         "writing_button": "📚 Writing",
         "art_image_button": "🎨 Image",
@@ -406,24 +392,19 @@ TEXTS = {
         "business_button": "📈 Business",
         "brainstorm_button": "🧠 Brainstorm",
         "other_button": "❓ Other",
-        # Best AI Subcategories
         "chat_models_button": "Chat Models",
         "code_dev_ai_button": "Code & Dev",
         "image_art_ai_button": "Image & Art",
         "audio_music_ai_button": "Audio & Music",
         "video_ai_button": "Video",
         "business_ai_button": "Business & Specialized",
-        # Error messages
         "processing_error": "❌ Error processing request",
-        "ai_communication_error": "❌ Error communicating with AI",
-        # New messages for opening links
+        "ai_communication_error": "❌ Error",
         "visit_website_message": "Click the button below to visit the {tool_name} website:",
         "visit_website_button": "Open Website",
         "tool_not_found": "Sorry, a link for this tool could not be found.",
-        # New messages for splitting feature
         "continue_button": "Continue ▶️",
         "message_part_indicator": "(Part {current}/{total})",
-        # Broadcast messages
         "broadcast_sent": "✅ Message successfully sent to {count} users.",
         "broadcast_failed": "❌ Failed to send message to {count} users.",
         "no_users": "No users found in the database.",
@@ -431,7 +412,6 @@ TEXTS = {
         "broadcast_usage": "Usage: /broadcast your message",
         "download_users_button": "📄 Download User List",
         "users_list_sent": "✅ User list sent successfully.",
-        # System instruction and prompt generation patterns
         "system_instruction": (
             "You are a professional prompt formatter. "
             "Your task is to rewrite the user's input into a clear, precise, and concise command for a specialized AI assistant. "
@@ -496,38 +476,26 @@ TEXTS = {
         }
     }
 }
-
-# لیست مدل‌های زبان بزرگ و گفتگو
 LLM_MODELS = [
     "GPT", "Claude", "Gemini", "Llama", 
     "Mistral Large", "Grok", "Command R+", "Cohere"
 ]
-
-# لیست ابزارهای کدنویسی و توسعه
 CODE_DEV_TOOLS = [
     "GitHub Copilot", "CodeLlama", "Amazon CodeWhisperer", 
     "Tabnine", "Replit Ghostwriter", "Z"
 ]
-
-# لیست ابزارهای تولید تصویر و هنر دیجیتال
 IMAGE_ART_TOOLS = [
     "Midjourney", "DALL-E", "Stable Diffusion", 
     "Adobe Firefly", "Ideogram"
 ]
-
-# لیست ابزارهای تولید صدا و موسیقی
 AUDIO_MUSIC_TOOLS = [
     "Suno", "Udio", "ElevenLabs", 
     "Murf", "AIVA"
 ]
-
-# لیست ابزارهای تولید ویدیو
 VIDEO_TOOLS = [
     "Sora", "Gemini", "Pika Labs", 
     "Runway Gen", "HeyGen", "Synthesia"
 ]
-
-# لیست ابزارهای تخصصی و کسب‌وکار
 BUSINESS_TOOLS = [
     "Perplexity", "kimi", "Jasper", 
     "Z", "Gamma", "Zapier Central"
@@ -542,8 +510,6 @@ def create_inline_keyboard(tools_list):
     ایجاد یک کیبورد اینلاین با حداکثر 2 دکمه در هر ردیف برای جلوگیری از کوتاه شدن نام‌ها.
     """
     keyboard = telebot.types.InlineKeyboardMarkup()
-    
-    # تقسیم ابزارها به ردیف‌های 2 تایی
     rows = [tools_list[i:i+2] for i in range(0, len(tools_list), 2)]
     
     for row in rows:
@@ -556,17 +522,12 @@ def ensure_code_block(text, language=""):
     """
     تابعی برای اطمینان از اینکه متن داخل بلوک کد قرار دارد
     """
-    # اگر متن قبلاً داخل بلوک کد است، آن را برگردان
     if text.startswith('```') and text.endswith('```'):
         return text
-    
-    # اگر متن شامل بلوک کد است، آن را استخراج کن
     if '```' in text:
         parts = text.split('```')
         if len(parts) >= 3:
-            # اولین بلوک کد را برگردان
             code_content = parts[1]
-            # اگر اولین خط زبان است، آن را جدا کن
             lines = code_content.split('\n')
             if len(lines) > 1:
                 lang = lines[0].strip()
@@ -574,8 +535,6 @@ def ensure_code_block(text, language=""):
                 return f"```{lang}\n{code}\n```"
             else:
                 return f"```\n{code_content}\n```"
-    
-    # در غیر این صورت، کل متن را در یک بلوک کد قرار بده
     return f"```{language}\n{text}\n```"
 
 def safe_send_message(chat_id, text, reply_markup=None, parse_mode=None, retries=3):
@@ -588,7 +547,7 @@ def safe_send_message(chat_id, text, reply_markup=None, parse_mode=None, retries
         except Exception as e:
             print(f"Attempt {attempt + 1} failed: {e}")
             if attempt < retries - 1:
-                time.sleep(2)  # صبر 2 ثانیه قبل از تلاش مجدد
+                time.sleep(2)
             else:
                 print(f"Failed to send message after {retries} attempts: {e}")
                 raise
@@ -603,7 +562,7 @@ def safe_send_document(chat_id, document, caption=None, retries=3):
         except Exception as e:
             print(f"Attempt {attempt + 1} failed: {e}")
             if attempt < retries - 1:
-                time.sleep(2)  # صبر 2 ثانیه قبل از تلاش مجدد
+                time.sleep(2)
             else:
                 print(f"Failed to send document after {retries} attempts: {e}")
                 raise
@@ -611,25 +570,16 @@ def safe_send_document(chat_id, document, caption=None, retries=3):
 @bot.message_handler(commands=['start'])
 def start_handler(message):
     user_id = message.from_user.id
-    username = message.from_user.username # دریافت نام کاربری
-    
-    # ذخیره شناسه کاربر و نام کاربری در دیتابیس
-    save_user_id(user_id, username)
-    
-    # نمایش کیبورد انتخاب زبان
+    save_user_id(user_id)
     lang_keyboard = telebot.types.InlineKeyboardMarkup()
     lang_keyboard.row(
         telebot.types.InlineKeyboardButton(text="فارسی", callback_data="lang_fa"),
         telebot.types.InlineKeyboardButton(text="English", callback_data="lang_en")
     )
-    
-    # ارسال پیام خوشامدگویی و درخواست انتخاب زبان با استفاده از توابع امن
     try:
         safe_send_message(user_id, TEXTS["fa"]["welcome"], reply_markup=lang_keyboard)
     except Exception as e:
         print(f"Error sending welcome message: {e}")
-    
-    # تنظیم وضعیت کاربر به انتظار برای انتخاب زبان
     user_states[user_id] = {"step": "awaiting_language"}
 
 @bot.message_handler(commands=['broadcast'])
@@ -638,20 +588,16 @@ def broadcast_handler(message):
     ارسال پیام به تمام کاربران (فقط برای ادمین)
     """
     user_id = message.from_user.id
-    
-    # بررسی اینکه آیا کاربر ادمین است
     if user_id != ADMIN_ID:
         bot.send_message(user_id, TEXTS["fa"]["admin_only"])
         return
-    
-    # استخراج پیام از دستور
     parts = message.text.split(' ', 1)
     if len(parts) < 2:
         bot.send_message(user_id, TEXTS["fa"]["broadcast_usage"])
         return
     
     broadcast_message = parts[1]
-    users = get_all_users() # دریافت لیست (user_id, username)
+    users = get_all_users()
     
     if not users:
         bot.send_message(user_id, TEXTS["fa"]["no_users"])
@@ -660,16 +606,14 @@ def broadcast_handler(message):
     success_count = 0
     failed_count = 0
     
-    for user_id, _ in users: # فقط user_id برای ارسال پیام کافی است
+    for user_id in users:
         try:
             safe_send_message(user_id, broadcast_message)
             success_count += 1
-            time.sleep(0.1)  # کمی تأخیر برای جلوگیری از محدودیت تلگرام
+            time.sleep(0.1)
         except Exception as e:
             print(f"Failed to send message to {user_id}: {e}")
             failed_count += 1
-    
-    # ارسال گزارش به ادمین
     report = f"{TEXTS['fa']['broadcast_sent'].format(count=success_count)}"
     if failed_count > 0:
         report += f"\n{TEXTS['fa']['broadcast_failed'].format(count=failed_count)}"
@@ -682,8 +626,6 @@ def stats_handler(message):
     نمایش آمار کاربران و امکان دریافت لیست کامل (فقط برای ادمین)
     """
     user_id = message.from_user.id
-    
-    # بررسی اینکه آیا کاربر ادمین است
     if user_id != ADMIN_ID:
         bot.send_message(user_id, TEXTS["fa"]["admin_only"])
         return
@@ -695,8 +637,6 @@ def stats_handler(message):
     stats_message += f"👥 تعداد کل کاربران: {total_users}\n"
     stats_message += f"💾 ذخیره‌سازی: دیتابیس PostgreSQL\n\n"
     stats_message += "برای دریافت لیست کامل کاربران، روی دکمه زیر کلیک کنید:"
-    
-    # ایجاد کیبورد اینلاین با دکمه دانلود
     keyboard = telebot.types.InlineKeyboardMarkup()
     keyboard.add(telebot.types.InlineKeyboardButton(
         text=TEXTS["fa"]["download_users_button"], 
@@ -714,62 +654,35 @@ def callback_query_handler(call):
     state = user_states.get(user_id, {})
     lang = state.get("language", "fa")
     texts = TEXTS[lang]
-    
-    # مدیریت انتخاب زبان
     if call.data.startswith("lang_"):
         selected_lang = call.data.split("_")[1]
-        
-        # به‌روزرسانی وضعیت کاربر با زبان انتخاب شده
         user_states[user_id] = {"step": "category", "language": selected_lang}
-        
-        # ارسال پاسخ به callback_query برای اینکه دکمه لودینگ متوقف شود
         bot.answer_callback_query(callback_query_id=call.id)
-        
-        # ارسال منوی دسته‌بندی‌ها با زبان انتخاب شده
         send_category_menu(user_id, selected_lang)
-    
-    # مدیریت کلیک روی دکمه "ادامه"
     elif call.data.startswith("continue_"):
-        # بازیابی اطلاعات بخش بعدی از حافظه
         next_chunk_index = state.get("next_chunk_index", 0)
         all_chunks = state.get("message_chunks", [])
         
         if next_chunk_index < len(all_chunks):
             next_chunk_text = all_chunks[next_chunk_index]
             next_chunk_index += 1
-            
-            # به‌روزرسانی وضعیت کاربر
             state["next_chunk_index"] = next_chunk_index
-            
-            # ساخت کیبورد برای بخش بعدی
             keyboard = telebot.types.InlineKeyboardMarkup()
             if next_chunk_index < len(all_chunks):
                 keyboard.add(telebot.types.InlineKeyboardButton(text=texts["continue_button"], callback_data=f"continue_{next_chunk_index}"))
-            
-            # ارسال بخش بعدی پیام
             bot.send_message(user_id, next_chunk_text, reply_markup=keyboard)
             bot.answer_callback_query(call.id)
         else:
             bot.answer_callback_query(call.id, "خطا: بخش بعدی یافت نشد.", show_alert=True)
-    
-    # مدیریت کلیک روی دکمه دانلود کاربران
     elif call.data == "download_users":
         user_id = call.from_user.id
-        
-        # بررسی اینکه آیا کاربر ادمین است
         if user_id != ADMIN_ID:
             bot.answer_callback_query(call.id, TEXTS["fa"]["admin_only"], show_alert=True)
             return
         
         try:
-            # ایجاد یک فایل متنی موقت از لیست کاربران با فرمت خوانا
             users = get_all_users()
-            # فرمت کردن هر کاربر به صورت "ID (@username)" یا فقط "ID" اگر نام کاربری وجود نداشت
-            user_list_str = "\n".join(
-                f"{uid} (@{uname})" if uname else str(uid) for uid, uname in users
-            )
-            
-            # ارسال فایل به عنوان یک سند
+            user_list_str = "\n".join(map(str, users))
             bot.send_document(
                 user_id,
                 user_list_str.encode('utf-8'),
@@ -779,23 +692,14 @@ def callback_query_handler(call):
         except Exception as e:
             print(f"Error sending users file: {e}")
             bot.answer_callback_query(call.id, "خطا در ارسال فایل.", show_alert=True)
-    
-    # مدیریت کلیک روی ابزارها
     elif call.data.startswith("tool_"):
         tool_name = call.data.split('_', 1)[1]
-        
-        # ارسال پاسخ به callback_query برای اینکه دکمه لودینگ متوقف شود
         bot.answer_callback_query(call.id)
-        
-        # پیدا کردن آدرس وب‌سایت ابزار
         url = AI_TOOL_URLS.get(tool_name)
         
         if url:
-            # ایجاد کیبورد با دکمه لینک
             keyboard = telebot.types.InlineKeyboardMarkup()
             keyboard.add(telebot.types.InlineKeyboardButton(text=texts["visit_website_button"], url=url))
-            
-            # ارسال پیام به کاربر
             bot.send_message(
                 user_id,
                 texts["visit_website_message"].format(tool_name=tool_name),
@@ -803,7 +707,6 @@ def callback_query_handler(call):
                 parse_mode="Markdown"
             )
         else:
-            # اگر ابزار پیدا نشد
             bot.send_message(user_id, texts["tool_not_found"])
 
 def send_category_menu(user_id, lang):
@@ -825,12 +728,41 @@ def send_category_menu(user_id, lang):
         parse_mode="Markdown"
     )
 
+# --- شروع بخش امنیتی: تابع و فراخوانی محدودیت نرخ ---
+def is_rate_limited(user_id):
+    """بررسی می‌کند که آیا کاربر از محدودیت نرخ عبور کرده است یا خیر."""
+    current_time = time.time()
+    
+    if user_id not in user_request_counts:
+        user_request_counts[user_id] = {'count': 1, 'start_time': current_time}
+        return False
+    
+    user_data = user_request_counts[user_id]
+    
+    if current_time - user_data['start_time'] > RATE_LIMIT_SECONDS:
+        user_data['count'] = 1
+        user_data['start_time'] = current_time
+        return False
+    
+    user_data['count'] += 1
+    
+    if user_data['count'] > RATE_LIMIT_COUNT:
+        return True
+    
+    return False
+
 @bot.message_handler(func=lambda message: True)
 def message_handler(message):
     user_id = message.from_user.id
-    state = user_states.get(user_id, {})
     
-    # اگر کاربر هنوز زبان خود را انتخاب نکرده است، کاری نکن
+    # بررسی محدودیت نرخ
+    if is_rate_limited(user_id):
+        bot.send_message(user_id, "⏳ شما در حال حاضر درخواست‌های زیادی ارسال کرده‌اید. لطفاً پس از مدتی دوباره تلاش کنید.")
+        return
+    
+    state = user_states.get(user_id, {})
+# --- پایان بخش امنیتی ---
+
     if not state or "language" not in state:
         return
     
@@ -838,13 +770,11 @@ def message_handler(message):
     texts = TEXTS[lang]
     current_step = state.get("step")
 
-    # مدیریت دکمه‌های بازگشت و تغییر دسته‌بندی
     if message.text == texts["back_to_main"] or message.text == texts["change_category"]:
         state["step"] = "category"
         send_category_menu(user_id, lang)
         return
-
-    # مدیریت کلیک روی دکمه Jaguar
+    
     if message.text == texts["jaguar_button"]:
         state["step"] = "jaguar_chat"
         
@@ -857,8 +787,7 @@ def message_handler(message):
             reply_markup=back_button
         )
         return
-
-    # مدیریت دسته‌بندی Best AI
+    
     if message.text == texts["best_ai_button"]:
         state["step"] = "best_ai_category"
         markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -874,8 +803,6 @@ def message_handler(message):
             parse_mode="Markdown"
         )
         return
-
-    # مدیریت دسته‌بندی‌های Best AI
     if current_step == "best_ai_category":
         if message.text == texts["chat_models_button"]:
             bot.send_message(
@@ -920,30 +847,17 @@ def message_handler(message):
                 parse_mode="Markdown"
             )
         return
-
-    # مدیریت چت با Jaguar
     if current_step == "jaguar_chat":
         user_input = message.text.strip()
-        
-        # نمایش پیام در حال تایپ
         bot.send_chat_action(user_id, 'typing')
-        
-        # دریافت پاسخ از Jaguar
         response_data = chat_with_jaguar(user_input, lang)
-        
         response_text = response_data["text"]
         is_code_request = response_data.get("is_code_request", False)
-        
-        # ساخت کیبورد بازگشت
         back_button = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
         back_button.row(texts["back_to_main"])
-        
-        # اگر درخواست کد است، پاسخ را داخل بلوک کد قرار می‌دهیم
+
         if is_code_request:
-            # تشخیص زبان کد
             code_lang = ""
-            
-            # بررسی کلمات کلیدی برای تشخیص زبان
             if any(keyword in user_input.lower() for keyword in ["python", "پایتون"]):
                 code_lang = "python"
             elif any(keyword in user_input.lower() for keyword in ["javascript", "js", "جاوااسکریپت"]):
@@ -960,11 +874,9 @@ def message_handler(message):
                 code_lang = "sql"
             elif any(keyword in user_input.lower() for keyword in ["c", "سی"]):
                 code_lang = "c"
-            
-            # اطمینان از اینکه پاسخ داخل بلوک کد است
+
             formatted_response = ensure_code_block(response_text, code_lang)
-            
-            # ارسال پاسخ با فرمت کد
+
             bot.send_message(
                 user_id,
                 formatted_response,
@@ -981,12 +893,11 @@ def message_handler(message):
             )
         return
 
-    # مدیریت دسته‌بندی‌های اصلی
     if current_step == "category":
         state["category"] = message.text
         state["step"] = "awaiting_input"
 
-        back_button = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+        back_button = telebot.types.InlineKeyboardMarkup(resize_keyboard=True)
         back_button.row(texts["change_category"])
 
         bot.send_message(
@@ -1006,7 +917,6 @@ def message_handler(message):
         back_button = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
         back_button.row(texts["change_category"])
 
-        # ارسال پرامپت تولید شده داخل بلوک کد
         bot.send_message(user_id, f"```\n{final_prompt}\n```", parse_mode="Markdown", reply_markup=back_button)
 
 def is_simple_task(text):
@@ -1033,8 +943,7 @@ def chat_with_jaguar(user_input, language):
     چت با هوش مصنوعی Jaguar (با قابلیت تقسیم پیام طولانی)
     """
     texts = TEXTS[language]
-    
-    # دستورالعمل سیستم برای Jaguar
+
     if language == "fa":
         base_system_instruction = (
             "تو Jaguar هستی، یک دستیار هوش مصنوعی ساخته‌شده توسط Ehsan. "
@@ -1098,17 +1007,14 @@ def chat_with_jaguar(user_input, language):
                 response_data = response.json()
                 ai_response = response_data['choices'][0]['message']['content'].strip()
                 
-                # تقسیم پاسخ طولانی به بخش‌های کوچکتر
                 max_message_length = 4000  # حداکثر طول پیام در تلگرام
                 
                 if len(ai_response) <= max_message_length:
-                    # اگر پاسخ کوتاه بود، آن را به صورت عادی برگردان
                     return {
                         "text": ai_response,
                         "is_code_request": is_code_request
                     }
                 else:
-                    # اگر پاسخ طولانی بود، آن را تقسیم و در حافظه ذخیره کن
                     chunks = []
                     current_chunk = ""
                     for i, char in enumerate(ai_response):
@@ -1116,22 +1022,19 @@ def chat_with_jaguar(user_input, language):
                         if (i + 1) % max_message_length == 0 and len(current_chunk) >= max_message_length:
                             chunks.append(current_chunk)
                             current_chunk = ""
-                    if current_chunk:  # اضافه کردن آخرین بخش
+                    if current_chunk:
                         chunks.append(current_chunk)
                     
-                    # ذخیره بخش‌ها در وضعیت کاربر
                     user_id_str = str(message.from_user.id)
                     user_states[user_id_str]["message_chunks"] = chunks
                     user_states[user_id_str]["next_chunk_index"] = 1
                     
-                    # ساخت کیبورد با دکمه ادامه
                     keyboard = telebot.types.InlineKeyboardMarkup()
                     keyboard.add(telebot.types.InlineKeyboardButton(
                         text=texts["continue_button"], 
                         callback_data=f"continue_1"
                     ))
                     
-                    # اضافه کردن شماره بخش به اولین پیام
                     first_chunk_text = chunks[0] + f"\n\n{texts['message_part_indicator'].format(current=1, total=len(chunks))}"
                     
                     return {
@@ -1140,7 +1043,7 @@ def chat_with_jaguar(user_input, language):
                         "is_code_request": is_code_request
                     }
             
-            elif response.status_code == 429:  # 429 Too Many Requests
+            elif response.status_code == 429:
                 if attempt < max_retries - 1:
                     print(f"Rate limit hit. Retrying in {retry_delay} seconds... (Attempt {attempt + 1}/{max_retries})")
                     time.sleep(retry_delay)
@@ -1148,7 +1051,8 @@ def chat_with_jaguar(user_input, language):
                 else:
                     return {"text": texts.get("rate_limit_error", "Rate limit exceeded. Please try again later."), "is_code_request": is_code_request}
             elif response.status_code == 401 or response.status_code == 403:
-                return {"text": texts.get("invalid_api_key_error", "Invalid API key."), "is_code_request": is_code_request}
+                print(f"API Authentication Error. Check OPENROUTER_API_KEY.")
+                return {"text": texts.get("api_server_error", "API server error."), "is_code_request": is_code_request}
             else:
                 print(f"API Error: Status Code {response.status_code}, Response: {response.text}")
                 return {"text": texts.get("api_server_error", "API server error."), "is_code_request": is_code_request}
@@ -1162,7 +1066,7 @@ def chat_with_jaguar(user_input, language):
             else:
                 return {"text": texts.get("network_error", "Network error."), "is_code_request": is_code_request}
         except Exception as e:
-            print(f"An unexpected error occurred in chat_with_jaguar: {e}")
+            print(f"An unexpected error occurred in chat_with_jaguar")
             return {"text": texts.get("unknown_error", "An unknown error occurred."), "is_code_request": is_code_request}
 
     return {"text": texts.get("unknown_error", "An unknown error occurred."), "is_code_request": is_code_request}
@@ -1176,7 +1080,7 @@ def generate_request(user_input, category, language):
     patterns = texts["patterns"]
 
     max_retries = 2
-    retry_delay = 5  # 5 ثانیه
+    retry_delay = 5
 
     for attempt in range(max_retries):
         try:
@@ -1233,25 +1137,21 @@ def generate_request(user_input, category, language):
             else:
                 return texts.get("network_error", "Network error.")
         except Exception as e:
-            print(f"An unexpected error occurred in generate_request: {e}")
+            print(f"An unexpected error occurred in generate_request")
             return texts.get("unknown_error", "An unknown error occurred.")
 
     return texts.get("unknown_error", "An unknown error occurred.")
 
 if __name__ == '__main__':
-    # --- تغییرات مربوط به دیتابیس ---
-    # ابتدا جدول دیتابیس را ایجاد یا بررسی کن
+    validate_environment()
     try:
         init_db()
     except Exception as e:
         print(f"Fatal: Could not initialize database. Exiting. Error: {e}")
-        exit() # اگر دیتابیس آماده نباشد، برنامه نباید اجرا شود
+        exit()
 
-    # اجرای ربات در یک Thread جداگانه
     bot_thread = Thread(target=run_bot)
     bot_thread.start()
     
-    # اجرای وب سرور Flask
-    # Render به طور خودکار پورت را از طریق متغیرهای محیطی مشخص می‌کند
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
