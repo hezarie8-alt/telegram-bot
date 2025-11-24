@@ -637,11 +637,10 @@ def broadcast_handler(message):
     bot.send_message(message.from_user.id, report)
 
 @bot.message_handler(commands=['stats'])
-@bot.message_handler(commands=['stats'])
 def stats_handler(message):
     """
     نمایش آمار کاربران و امکان دریافت لیست کامل (فقط برای ادمین)
-    این نسخه با دیتابیس قدیمی و جدید سازگار است.
+    این نسخه با دیتابیس قدیمی و جدید سازگار است و خطای تراکنش را مدیریت می‌کند.
     """
     user_id = message.from_user.id
     if user_id != ADMIN_ID:
@@ -653,13 +652,14 @@ def stats_handler(message):
         conn = get_db_connection()
         with conn.cursor() as cursor:
             stats_message = ""
-            is_new_db = True
-
+            
             # تلاش برای اجرای کوئری جدید (برای دیتابیس به‌روز)
             try:
+                # شمارش کل
                 cursor.execute("SELECT COUNT(user_id) FROM users;")
                 total_users = cursor.fetchone()[0]
 
+                # دریافت ۱۰ نفر آخر
                 cursor.execute("""
                     SELECT user_id, first_name, username 
                     FROM users 
@@ -678,12 +678,19 @@ def stats_handler(message):
                 else:
                     for user_row in recent_users_data:
                         uid, first_name, username = user_row
-                        user_tag = f"@{username}" if username else "بدون نام کاربری"
-                        stats_message += f"  - {first_name} ({user_tag}) - ID: `{uid}`\n"
+                        # جلوگیری از بهم ریختن مارک‌داون با کاراکترهای خاص
+                        safe_name = str(first_name).replace("_", "\\_").replace("*", "\\*")
+                        safe_username = str(username).replace("_", "\\_") if username else "بدون نام کاربری"
+                        
+                        user_tag = f"@{safe_username}" if username else "No Username"
+                        stats_message += f" - {safe_name} ({user_tag}) - ID: `{uid}`\n"
 
             except psycopg2.errors.UndefinedColumn:
-                print("⚠️ ستون‌های جدید در دیتابیس یافت نشد. نمایش آمار به صورت قدیمی.")
-                is_new_db = False
+                # --- نکته مهم: ریست کردن تراکنش پس از خطا ---
+                conn.rollback()
+                print("⚠️ ستون‌های جدید در دیتابیس یافت نشد. سوییچ به حالت سازگاری.")
+                
+                # اجرای کوئری ساده (قدیمی)
                 cursor.execute("SELECT user_id FROM users;")
                 all_user_ids = [row[0] for row in cursor.fetchall()]
                 total_users = len(all_user_ids)
@@ -691,12 +698,12 @@ def stats_handler(message):
                 stats_message = f"📊 **آمار ربات Jaguar (حالت سازگاری):**\n\n"
                 stats_message += f"👥 **تعداد کل کاربران:** `{total_users}`\n"
                 stats_message += f"💾 **ذخیره‌سازی:** دیتابیس PostgreSQL\n\n"
-                stats_message += "⚠️ **توجه:** ساختار دیتابیس شما قدیمی است و برای نمایش اطلاعات کامل نیاز به به‌روزرسانی دارد.\n"
-                stats_message += "📋 **نمونه‌ای از شناسه کاربران:**\n"
+                stats_message += "⚠️ **توجه:** ساختار دیتابیس قدیمی است (ستون join_date یافت نشد).\n"
+                stats_message += "📋 **نمونه‌ای از شناسه کاربران (۱۰ نفر اول):**\n"
                 for uid in all_user_ids[:10]:
-                    stats_message += f"  - ID: `{uid}`\n"
+                    stats_message += f" - ID: `{uid}`\n"
             
-            # دکمه دانلود لیست کاربران همیشه نمایش داده می‌شود
+            # دکمه دانلود لیست کاربران
             keyboard = telebot.types.InlineKeyboardMarkup()
             keyboard.add(telebot.types.InlineKeyboardButton(
                 text=TEXTS["fa"]["download_users_button"], 
@@ -707,8 +714,9 @@ def stats_handler(message):
 
     except Exception as e:
         print(f"❌ خطا در دریافت آمار: {e}")
+        # رول‌بک کردن در صورت خطای کلی
         if conn:
-            conn.rollback() 
+            conn.rollback()
         bot.send_message(user_id, "خطایی در ارتباط با دیتابیس رخ داد. لطفاً بعداً تلاش کنید.")
     finally:
         if conn:
