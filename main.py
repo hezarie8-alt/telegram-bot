@@ -707,6 +707,8 @@ def stats_handler(message):
 
     except Exception as e:
         print(f"❌ خطا در دریافت آمار: {e}")
+        if conn:
+            conn.rollback() 
         bot.send_message(user_id, "خطایی در ارتباط با دیتابیس رخ داد. لطفاً بعداً تلاش کنید.")
     finally:
         if conn:
