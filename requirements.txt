@@ -2,3 +2,5 @@ Flask
 pyTelegramBotAPI
 requests
 psycopg2-binary
+Flask-Migrate
+Flask-SQLAlchemy
