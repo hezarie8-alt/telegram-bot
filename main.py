@@ -49,30 +49,43 @@ def release_db_connection(conn):
         db_pool.putconn(conn)
 
 def init_db():
-    """ایجاد یا به‌روزرسانی جدول کاربران در دیتابیس"""
+    """ایجاد جدول کاربران در صورت عدم وجود و به‌روزرسانی ستون‌ها"""
     conn = None
     try:
         conn = get_db_connection()
         with conn.cursor() as cursor:
+            # ۱. ساخت جدول اگر وجود نداشته باشد
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    username VARCHAR(255),
+                    first_name VARCHAR(255),
+                    last_name VARCHAR(255),
+                    join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            
+            # ۲. بررسی وجود ستون join_date (برای آپدیت نسخه‌های قدیمی)
             cursor.execute("""
                 SELECT column_name 
                 FROM information_schema.columns 
                 WHERE table_name = 'users' AND column_name = 'join_date';
             """)
+            
             if not cursor.fetchone():
-                print("🔧 در حال به‌روزرسانی ساختار دیتابیس برای افزودن ستون‌های جدید...")
+                print("🔧 در حال به‌روزرسانی ساختار دیتابیس...")
                 cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(255);")
                 cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name VARCHAR(255);")
                 cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name VARCHAR(255);")
                 cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP;")
-                print("✅ ساختار دیتابیس با موفقیت به‌روزرسانی شد.")
-            else:
-                print("✅ ساختار دیتابیس جدید است و نیازی به به‌روزرسانی ندارد.")
+                print("✅ ساختار دیتابیس به‌روزرسانی شد.")
             
             conn.commit()
-            print("✅ جدول کاربران با موفقیت ایجاد یا تایید شد.")
+            print("✅ دیتابیس آماده استفاده است.")
     except Exception as e:
-        print(f"❌ خطا در ایجاد/به‌روزرسانی جدول دیتابیس: {e}")
+        print(f"❌ خطا در مدیریت دیتابیس: {e}")
+        if conn:
+            conn.rollback()
     finally:
         if conn:
             release_db_connection(conn)
